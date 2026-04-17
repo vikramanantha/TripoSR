@@ -162,3 +162,10 @@ cython_debug/
 # default output directory
 output/
 outputs/
+
+
+frame_check
+render_output
+sdf_*/
+wandb/
+features.pt
