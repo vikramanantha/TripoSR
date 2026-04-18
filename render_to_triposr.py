@@ -33,8 +33,9 @@ Setup
         PYOPENGL_PLATFORM=osmesa python render_to_triposr.py ...
 """
 
-import os
 import argparse
+import json
+import os
 import shutil
 import subprocess
 import sys
@@ -157,9 +158,23 @@ def _load_trimesh(path: str) -> trimesh.Trimesh:
 
 def _camera_pose(azimuth_deg: float, elevation_deg: float, distance: float) -> np.ndarray:
     """
-    4×4 camera-to-world matrix for a camera looking at the origin from a
-    position defined by azimuth/elevation/distance.  OpenGL convention:
-    camera looks along -Z, Y is up.
+    4×4 **camera-to-world** transform T_cam→world (pyrender / OpenGL).
+
+    **World frame** for the render pass: right-handed, mesh centered at the origin
+    after `mesh.apply_translation(-centroid)` and scaled so its longest edge is 1.
+
+    Columns of the upper-left 3×3 are camera basis vectors expressed in world coords:
+      - Column 0: camera +X (points **right** in the image).
+      - Column 1: camera +Y (points **up** in the image).
+      - Column 2: camera +Z (points from the scene toward the camera, i.e. “out of”
+        the monitor in camera space; in world this is **from origin toward cam_pos**).
+
+    The camera **position** is ``T[:3, 3] = cam_pos``. The camera **looks** from
+    ``cam_pos`` toward the origin (OpenGL look direction is **-camera +Z** in world,
+    i.e. from camera into the scene).
+
+    Spherical placement: azimuth in XY from +X, elevation from XY plane; distance
+    is ``||cam_pos||`` (camera looks at origin).
     """
     az = np.radians(azimuth_deg)
     el = np.radians(elevation_deg)
@@ -185,6 +200,66 @@ def _camera_pose(azimuth_deg: float, elevation_deg: float, distance: float) -> n
     pose[:3, 2] = -forward   # OpenGL: camera looks along -Z
     pose[:3, 3] = cam_pos
     return pose
+
+
+def _tripo_recon_rotation_to_pyrender_world(T_camera_to_world: np.ndarray) -> np.ndarray:
+    """
+    TripoSR recon meshes are observed to align with the **capturing camera**:
+    +X toward the camera, +Y to the right in the image, +Z up.
+
+    In pyrender world, those directions are camera +Z, +X, +Y respectively, i.e.
+    columns 2, 0, 1 of T_cam→world. Returns R (3×3) with
+    ``p_world = R @ p_recon`` (same translation as before; rotation only).
+    """
+    R = np.stack(
+        [T_camera_to_world[:3, 2], T_camera_to_world[:3, 0], T_camera_to_world[:3, 1]],
+        axis=1,
+    )
+    return R
+
+
+def _write_camera_extrinsics_json(
+    path: str,
+    T_camera_to_world: np.ndarray,
+    *,
+    azimuth_deg: float,
+    elevation_deg: float,
+    distance: float,
+    fov_deg: float,
+) -> None:
+    """Save pose + R (recon→pyrender world); ``view_mesh`` overlay applies Rᵀ to the source."""
+    R = _tripo_recon_rotation_to_pyrender_world(T_camera_to_world)
+    cam_pos = T_camera_to_world[:3, 3]
+    forward_into_scene = -T_camera_to_world[:3, 2]  # OpenGL -Z_cam in world
+    data = {
+        "schema": "tripo_sr_render_to_triposr_v1",
+        "world_frame": (
+            "Mesh at origin after centroid centering; longest edge scaled to 1. "
+            "Right-handed. Camera pose is OpenGL camera-to-world."
+        ),
+        "capture": {
+            "azimuth_deg": azimuth_deg,
+            "elevation_deg": elevation_deg,
+            "camera_distance": float(distance),
+            "fov_deg": fov_deg,
+        },
+        "T_camera_to_world_4x4": T_camera_to_world.tolist(),
+        "cam_position_world": cam_pos.tolist(),
+        "camera_looks_from_cam_along_minus_Z_in_world": forward_into_scene.tolist(),
+        "camera_right_in_world": T_camera_to_world[:3, 0].tolist(),
+        "camera_up_in_world": T_camera_to_world[:3, 1].tolist(),
+        "from_origin_toward_camera_unit": T_camera_to_world[:3, 2].tolist(),
+        "R_tripo_recon_to_pyrender_world_3x3": R.tolist(),
+        "notes": (
+            "TripoSR recon frame: +X toward camera, +Y image-right, +Z image-up. "
+            "R maps recon→pyrender world. Combined overlay applies Rᵀ to the **unit** "
+            "source mesh only; recon vertices are unchanged."
+        ),
+    }
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    print(f"[render] Camera extrinsics → {path}")
 
 
 def _directional_light_pose(azimuth_deg: float, elevation_deg: float) -> np.ndarray:
@@ -234,7 +309,18 @@ def render_mesh(
     fov_rad = np.radians(fov)
     distance = (0.7 / np.tan(fov_rad / 2))
     camera = pyrender.PerspectiveCamera(yfov=fov_rad, aspectRatio=1.0)
-    scene.add(camera, pose=_camera_pose(azimuth, elevation, distance))
+    T_cam_to_world = _camera_pose(azimuth, elevation, distance)
+    scene.add(camera, pose=T_cam_to_world)
+
+    extrinsics_path = os.path.join(os.path.dirname(out_image_path) or ".", "camera_extrinsics.json")
+    _write_camera_extrinsics_json(
+        extrinsics_path,
+        T_cam_to_world,
+        azimuth_deg=azimuth,
+        elevation_deg=elevation,
+        distance=float(distance),
+        fov_deg=fov,
+    )
 
     # Render at 2× then downsample for free anti-aliasing
     render_w = render_h = size * 2
@@ -348,7 +434,8 @@ def main() -> None:
     # Step 2 – TripoSR reconstruction
     out_mesh = run_triposr(render_path, output_dir)
 
-    # Step 3 – view
+    # Step 3 – view (overlay uses camera_extrinsics.json next to render for recon rotation)
+    extrinsics_path = os.path.join(output_dir, "camera_extrinsics.json")
     launch_viewer(
         out_mesh,
         mesh_path,
@@ -356,6 +443,7 @@ def main() -> None:
         output_dir,
         port=args.port,
         listen=args.listen,
+        camera_extrinsics_path=extrinsics_path if os.path.isfile(extrinsics_path) else None,
     )
 
 
