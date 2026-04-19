@@ -82,7 +82,7 @@ LR              = 1e-5
 EIKONAL_WEIGHT  = 0.0
 SDF_CLAMP       = 0.0
 NUM_WORKERS     = 4
-RUN_NAME        = "v0.3"
+RUN_NAME        = "v0.35"
 TEST_FRACTION   = 0.2        # fraction of meshes (UIDs) held out as unseen
 TEST_VIEW_FRACTION = 0.2     # fraction of azimuth views held out per mesh (0 = use all views)
 VIS_EVERY       = 5
@@ -306,14 +306,14 @@ def _load_trimesh(path: str):
 
 
 def _normalize_mesh_copy(raw, radius: float):
-    """Copy ``raw``, apply centroid removal + ``(2*radius)/longest`` scale (TripoSR volume)."""
+    """Copy ``raw``, apply centroid removal + unit-longest-edge scale (render_to_triposr convention)."""
     if len(raw.faces) == 0:
         raise ValueError("Mesh has no faces")
     centroid = np.asarray(raw.centroid, dtype=np.float64)
     longest = float(max(raw.extents) if max(raw.extents) > 0 else 1.0)
     mesh = raw.copy()
     mesh.apply_translation(-raw.centroid)
-    mesh.apply_scale((2.0 * radius) / longest)
+    mesh.apply_scale(1.0 / longest)
     return mesh, centroid, longest
 
 
@@ -329,8 +329,8 @@ def apply_mesh_normalization_transform(
     longest: float,
     radius: float,
 ) -> np.ndarray:
-    """``p_norm = (p_raw - centroid) * (2*radius / longest)`` — same as ``load_and_normalize_mesh``."""
-    s = (2.0 * radius) / float(longest)
+    """``p_norm = (p_raw - centroid) * (1.0 / longest)`` — same as ``load_and_normalize_mesh``."""
+    s = 1.0 / float(longest)
     c = np.asarray(centroid, dtype=np.float64)
     return (np.asarray(pts, dtype=np.float64) - c) * s
 
@@ -368,8 +368,8 @@ def _write_camera_extrinsics_json(
     data = {
         "schema": "tripo_sr_render_to_triposr_v1",
         "world_frame": (
-            "train_sdf_head precompute: mesh centroid at origin, longest edge scaled to 2*radius "
-            "(TripoSR volume). Camera is OpenGL camera-to-world."
+            "train_sdf_head precompute: mesh centroid at origin, longest edge scaled to 1 "
+            "(render_to_triposr convention). Camera is OpenGL camera-to-world."
         ),
         "capture": {
             "azimuth_deg": float(azimuth_deg),
@@ -515,13 +515,14 @@ def render_mesh_to_image(
         pr_mesh = pyrender.Mesh.from_trimesh(tr.Trimesh(vertices=mesh.vertices, faces=mesh.faces))
     scene.add(pr_mesh)
     fov_rad = np.radians(fov)
-    distance = (max(mesh.extents) / 2.0 / 0.7) / np.tan(fov_rad / 2.0)
+    # Match render_to_triposr.py: with unit-longest-edge mesh, use fixed framing distance.
+    distance = (0.7 / np.tan(fov_rad / 2.0))
     T_cam = _camera_pose(azimuth, elevation, distance)
     scene.add(pyrender.PerspectiveCamera(yfov=fov_rad, aspectRatio=1.0), pose=T_cam)
     scene.add(pyrender.DirectionalLight(color=[1.0, 1.0, 1.0], intensity=4.0),
-              pose=_camera_pose(20, elevation + 20, 1.0))
+              pose=_camera_pose(azimuth + 20, elevation + 20, 1.0))
     scene.add(pyrender.DirectionalLight(color=[0.7, 0.8, 1.0], intensity=1.5),
-              pose=_camera_pose(180, elevation - 10, 1.0))
+              pose=_camera_pose(azimuth + 180, elevation - 10, 1.0))
     if extrinsics_json_path is not None:
         _write_camera_extrinsics_json(
             extrinsics_json_path,
