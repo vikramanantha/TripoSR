@@ -191,6 +191,7 @@ def _combined_overlay_with_axes(
     show_source: bool = True,
     show_recon: bool = True,
     recon_R_world_from_recon: np.ndarray | None = None,
+    normalize_source_to_unit_cube: bool = True,
 ) -> str:
     """
     Single scene: optional source + optional reconstruction.
@@ -219,7 +220,10 @@ def _combined_overlay_with_axes(
         f"(max extent {recon_extent:.4f})"
     )
 
-    source = _normalize_mesh_to_unit_cube(source, "source")
+    if normalize_source_to_unit_cube:
+        source = _normalize_mesh_to_unit_cube(source, "source")
+    else:
+        print("[overlay] source: using mesh as-is (no extra normalize)")
     if recon_R_world_from_recon is not None:
         R_inv = recon_R_world_from_recon.T
         source = _apply_rotation_3x3(source, R_inv)
@@ -429,6 +433,190 @@ def launch_viewer(
         allowed_paths.append(camera_extrinsics_path)
     elif os.path.isfile(os.path.join(output_dir, "camera_extrinsics.json")):
         allowed_paths.append(os.path.join(output_dir, "camera_extrinsics.json"))
+    try:
+        app.launch(allowed_paths=allowed_paths, share=share, **kwargs)
+    except TypeError:
+        app.launch(**kwargs)
+
+
+def _prepare_sample_assets(sample: dict) -> dict:
+    """Pre-generate per-sample viewer assets (axes meshes + overlay) and return paths.
+
+    Expects keys: name, mesh_path, source_mesh_path, render_image_path,
+    output_dir, camera_extrinsics_path.
+    """
+    mesh_path = sample["mesh_path"]
+    source_mesh_path = sample.get("source_mesh_path")
+    output_dir = sample.get("output_dir") or os.path.dirname(mesh_path) or "."
+    extrinsics = sample.get("camera_extrinsics_path")
+    if extrinsics is None:
+        _default_ext = os.path.join(output_dir, "camera_extrinsics.json")
+        if os.path.isfile(_default_ext):
+            extrinsics = _default_ext
+    recon_R = _load_recon_rotation_from_extrinsics(extrinsics) if extrinsics else None
+    normalize_source_to_unit_cube = bool(sample.get("normalize_source_to_unit_cube", True))
+
+    vis_dir = os.path.join(output_dir, "viewer_axes")
+    recon_axes_path = _mesh_with_axes(
+        mesh_path, os.path.join(vis_dir, "reconstruction_with_axes.glb")
+    )
+    source_axes_path = None
+    overlay_path = None
+    if source_mesh_path:
+        source_axes_path = _mesh_with_axes(
+            source_mesh_path, os.path.join(vis_dir, "source_with_axes.glb")
+        )
+        overlay_path = _combined_overlay_with_axes(
+            source_mesh_path,
+            mesh_path,
+            os.path.join(vis_dir, "overlay_both_meshes.glb"),
+            recon_R_world_from_recon=recon_R,
+            normalize_source_to_unit_cube=normalize_source_to_unit_cube,
+        )
+
+    return {
+        **sample,
+        "output_dir": output_dir,
+        "camera_extrinsics_path": extrinsics,
+        "recon_axes_path": recon_axes_path,
+        "source_axes_path": source_axes_path,
+        "overlay_path": overlay_path,
+        "overlay_glb_path": os.path.join(vis_dir, "overlay_both_meshes.glb"),
+        "recon_R": recon_R,
+        "normalize_source_to_unit_cube": normalize_source_to_unit_cube,
+    }
+
+
+def build_multi_viewer(samples: list[dict]) -> gr.Blocks:
+    """Gradio app with a dropdown to switch between multiple precomputed samples.
+
+    Each entry in ``samples`` must have the same keys accepted by
+    ``_prepare_sample_assets``.
+    """
+    if not samples:
+        raise ValueError("build_multi_viewer requires at least one sample.")
+
+    prepared = [_prepare_sample_assets(s) for s in samples]
+    names = [p["name"] for p in prepared]
+    by_name = {p["name"]: p for p in prepared}
+    first = prepared[0]
+
+    with gr.Blocks(title=f"Mesh Viewer - {len(prepared)} samples") as app:
+        gr.Markdown(
+            "# Multi-sample Mesh Viewer\n"
+            "Dropdown switches between precomputed samples. For each sample: "
+            "blue = source (unit AABB, Rᵀ applied if `camera_extrinsics.json` present), "
+            "orange = TripoSR reconstruction from saved `triplane.pt`. Axes: +X red, +Y green, +Z up."
+        )
+        sample_dd = gr.Dropdown(
+            choices=names, value=first["name"], label="Sample", interactive=True
+        )
+
+        with gr.Row(equal_height=True):
+            source_model = gr.Model3D(
+                value=first["source_axes_path"],
+                clear_color=[1.0, 1.0, 1.0, 1.0],
+                label=f"Source mesh + axes ({os.path.basename(first['source_mesh_path'])})",
+            )
+            recon_model = gr.Model3D(
+                value=first["recon_axes_path"],
+                clear_color=[1.0, 1.0, 1.0, 1.0],
+                label="Reconstructed mesh + axes (drag to rotate, scroll to zoom)",
+            )
+
+        with gr.Row():
+            render_image = gr.Image(
+                value=first.get("render_image_path"),
+                label="Rendered input image",
+                interactive=False,
+            )
+            with gr.Column():
+                with gr.Row():
+                    show_source_cb = gr.Checkbox(value=True, label="Show source (blue)")
+                    show_recon_cb = gr.Checkbox(value=True, label="Show reconstruction (orange)")
+                overlay_model = gr.Model3D(
+                    value=first["overlay_path"],
+                    clear_color=[1.0, 1.0, 1.0, 1.0],
+                    label="Overlay: same coordinates (toggle meshes above)",
+                )
+
+        with gr.Row():
+            recon_file = gr.File(value=first["mesh_path"], label="Download reconstructed mesh")
+            source_file = gr.File(value=first["source_mesh_path"], label="Download source mesh")
+
+        def _refresh_overlay(sample_name: str, show_src: bool, show_recon: bool):
+            s = by_name[sample_name]
+            _combined_overlay_with_axes(
+                s["source_mesh_path"],
+                s["mesh_path"],
+                s["overlay_glb_path"],
+                show_source=show_src,
+                show_recon=show_recon,
+                recon_R_world_from_recon=s["recon_R"],
+                normalize_source_to_unit_cube=s["normalize_source_to_unit_cube"],
+            )
+            return gr.update(value=s["overlay_glb_path"])
+
+        def _on_sample_change(sample_name: str, show_src: bool, show_recon: bool):
+            s = by_name[sample_name]
+            _combined_overlay_with_axes(
+                s["source_mesh_path"],
+                s["mesh_path"],
+                s["overlay_glb_path"],
+                show_source=show_src,
+                show_recon=show_recon,
+                recon_R_world_from_recon=s["recon_R"],
+                normalize_source_to_unit_cube=s["normalize_source_to_unit_cube"],
+            )
+            return (
+                gr.update(
+                    value=s["source_axes_path"],
+                    label=f"Source mesh + axes ({os.path.basename(s['source_mesh_path'])})",
+                ),
+                gr.update(value=s["recon_axes_path"]),
+                gr.update(value=s.get("render_image_path")),
+                gr.update(value=s["overlay_glb_path"]),
+                gr.update(value=s["mesh_path"]),
+                gr.update(value=s["source_mesh_path"]),
+            )
+
+        sample_dd.change(
+            _on_sample_change,
+            inputs=[sample_dd, show_source_cb, show_recon_cb],
+            outputs=[source_model, recon_model, render_image, overlay_model, recon_file, source_file],
+        )
+        show_source_cb.change(
+            _refresh_overlay,
+            inputs=[sample_dd, show_source_cb, show_recon_cb],
+            outputs=[overlay_model],
+        )
+        show_recon_cb.change(
+            _refresh_overlay,
+            inputs=[sample_dd, show_source_cb, show_recon_cb],
+            outputs=[overlay_model],
+        )
+
+    return app
+
+
+def launch_multi_viewer(
+    samples: list[dict],
+    port: int = 7861,
+    listen: bool = False,
+    share: bool = True,
+) -> None:
+    app = build_multi_viewer(samples)
+    allowed_paths: list[str] = []
+    for s in samples:
+        for key in ("mesh_path", "source_mesh_path", "render_image_path",
+                    "output_dir", "camera_extrinsics_path"):
+            val = s.get(key)
+            if val:
+                allowed_paths.append(val)
+    kwargs = {
+        "server_name": "0.0.0.0" if listen else "localhost",
+        "server_port": port,
+    }
     try:
         app.launch(allowed_paths=allowed_paths, share=share, **kwargs)
     except TypeError:

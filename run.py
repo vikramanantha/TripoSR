@@ -70,6 +70,15 @@ parser.add_argument(
     help="Marching cubes grid resolution. Default: 256"
 )
 parser.add_argument(
+    "--roundtrip-scene-codes",
+    action="store_true",
+    help=(
+        "Save scene_codes[0] as half-precision CPU tensor, reload it from disk, "
+        "then run mesh extraction from the reloaded tensor. This mirrors the "
+        "train_sdf_head.py triplane save/load path."
+    ),
+)
+parser.add_argument(
     "--no-remove-bg",
     action="store_true",
     help="If specified, the background will NOT be automatically removed from the input image, and the input image should be an RGB image with gray background and properly-sized foreground. Default: false",
@@ -159,6 +168,32 @@ for i, image in enumerate(images):
         scene_codes = model([image], device=device)
     timer.end("Running model")
 
+    scene_codes_for_mesh = scene_codes
+    if args.roundtrip_scene_codes:
+        scene_code_path = os.path.join(output_dir, str(i), "triplane.pt")
+        os.makedirs(os.path.dirname(scene_code_path), exist_ok=True)
+        torch.save(scene_codes[0].half().cpu(), scene_code_path)
+        logging.info(f"Saved scene codes -> {scene_code_path}")
+
+        reloaded_scene_codes = torch.load(
+            scene_code_path, map_location="cpu", weights_only=False
+        )
+        # reloaded_scene_codes = torch.load("/home/markiv/TripoSR/render_output/0/triplane.pt", map_location="cpu", weights_only=False)
+        # print("reloaded_scene_codes")
+        if reloaded_scene_codes.ndim == 4:
+            reloaded_scene_codes = reloaded_scene_codes.unsqueeze(0)
+        if reloaded_scene_codes.ndim != 5:
+            raise ValueError(
+                f"Reloaded scene codes have unexpected shape: "
+                f"{tuple(reloaded_scene_codes.shape)}"
+            )
+        scene_codes_for_mesh = reloaded_scene_codes.float().to(device)
+        logging.info(
+            "Reloaded scene codes for mesh extraction with shape %s and dtype %s",
+            tuple(scene_codes_for_mesh.shape),
+            scene_codes_for_mesh.dtype,
+        )
+
     if args.render:
         timer.start("Rendering")
         render_images = model.render(scene_codes, n_views=30, return_type="pil")
@@ -169,8 +204,34 @@ for i, image in enumerate(images):
         )
         timer.end("Rendering")
 
+    # print(scene_codes_for_mesh)
     timer.start("Extracting mesh")
-    meshes = model.extract_mesh(scene_codes, not args.bake_texture, resolution=args.mc_resolution)
+    if args.roundtrip_scene_codes:
+        meshes = []
+        thresholds = [25.0, 15.0, 8.0, 2.0, 0.0, -2.0]
+        last_mesh = None
+        for threshold in thresholds:
+            meshes = model.extract_mesh(
+                scene_codes_for_mesh,
+                False,
+                resolution=256,
+                threshold=threshold,
+            )
+            last_mesh = meshes[0] if meshes else None
+            if last_mesh is not None and len(last_mesh.faces) > 0:
+                logging.info("Roundtrip scene codes produced mesh at threshold %.1f", threshold)
+                break
+        if last_mesh is not None and len(last_mesh.faces) == 0:
+            logging.warning(
+                "Roundtrip scene codes produced an empty mesh at all thresholds %s",
+                thresholds,
+            )
+    else:
+        meshes = model.extract_mesh(
+            scene_codes_for_mesh,
+            not args.bake_texture,
+            resolution=args.mc_resolution,
+        )
     timer.end("Extracting mesh")
 
     out_mesh_path = os.path.join(output_dir, str(i), f"mesh.{args.model_save_format}")

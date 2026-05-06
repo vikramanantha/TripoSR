@@ -47,7 +47,7 @@ sed_inplace() {
 PYTHON="$(resolve_python)"
 
 # ── Parse optional flag ──────────────────────────────────────────────────────
-MODE=""
+MODE="both"  # Default: precompute then train
 for arg in "$@"; do
     case "$arg" in
         --precompute) MODE="precompute" ;;
@@ -56,18 +56,13 @@ for arg in "$@"; do
     esac
 done
 
-if [[ -n "$MODE" ]]; then
-    echo "Overriding COMMAND -> $MODE"
-    sed_inplace "s/^COMMAND[[:space:]]*=[[:space:]]*\"[^\"]*\"/COMMAND = \"$MODE\"/" "$PY_SCRIPT"
-fi
+echo "Setting COMMAND -> $MODE"
+sed_inplace "s/^COMMAND[[:space:]]*=[[:space:]]*\"[^\"]*\"/COMMAND = \"$MODE\"/" "$PY_SCRIPT"
 
-# Portable read of COMMAND = "..." (no grep -P)
-COMMAND="$(awk -F'"' '/^COMMAND[[:space:]]*=/ {print $2; exit}' "$PY_SCRIPT")"
-if [[ -z "$COMMAND" ]]; then
-    echo "train_sdf.sh: could not parse COMMAND from $PY_SCRIPT" >&2
-    exit 1
+# In "both" mode the viewer would block between precompute and train — disable it.
+if [[ "$MODE" == "both" ]]; then
+    sed_inplace "s/^LAUNCH_VIEWER_AFTER_PRECOMPUTE[[:space:]]*=.*/LAUNCH_VIEWER_AFTER_PRECOMPUTE = False/" "$PY_SCRIPT"
 fi
-echo "COMMAND = $COMMAND"
 
 cd "$SCRIPT_DIR"
 exec "$PYTHON" "$PY_SCRIPT"

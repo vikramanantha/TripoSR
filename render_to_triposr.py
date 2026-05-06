@@ -362,6 +362,7 @@ def run_triposr(image_path: str, output_dir: str) -> str:
         "--output-dir", output_dir,
         "--no-remove-bg",
         "--model-save-format", "obj",
+        "--roundtrip-scene-codes",
     ]
     print(f"[triposr] Running: {' '.join(cmd)}")
     subprocess.run(cmd, check=True)

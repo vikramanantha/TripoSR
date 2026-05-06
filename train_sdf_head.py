@@ -22,12 +22,8 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock
 
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
-
-sys.modules["torchmcubes"] = MagicMock()
-sys.modules["rembg"] = MagicMock()
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -49,7 +45,7 @@ from skimage.measure import marching_cubes
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from tsr.utils import scale_tensor
+from tsr.utils import get_activation, scale_tensor
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
@@ -62,39 +58,43 @@ DATASET_DIR     = "/home/markiv/TripoSR/sdf_dataset"
 
 # ── Precompute ───────────────────────────────────────────────────────────────
 MODEL           = "stabilityai/TripoSR"
-N_OBJECTS       = 10
-AZIMUTHS_PER_MESH = 10
+N_OBJECTS       = 1
+AZIMUTHS_PER_MESH = 5
 N_POINTS        = 262144
 IMAGE_SIZE      = 256
 ELEVATION       = 30.0
 FOV             = 40.0
 MAX_MESH_MB     = 0.0
-VERBOSE         = False
+VERBOSE         = True
+MC_RESOLUTION   = 256                  # Marching-cubes resolution for TripoSR MLP decode (sanity-check mesh)
+LAUNCH_VIEWER_AFTER_PRECOMPUTE = False
 
 # ── Train ────────────────────────────────────────────────────────────────────
 OUTPUT_DIR      = "/home/markiv/TripoSR/sdf_checkpoints"
 EPOCHS          = 500
 SAVE_EVERY      = 10
-HIDDEN_DIM      = 64
+HIDDEN_DIM      = 256
+HIDDEN_DIM_NO_TRIPLANE = 256 # originally 256   # hidden dim when USE_TRIPLANE_FEATURES=False (needs more capacity)
 N_HIDDEN        = 10
 N_FREQS         = 6
-LR              = 1e-5
+LR              = 1e-3
 EIKONAL_WEIGHT  = 0.0
 SDF_CLAMP       = 0.0
 NUM_WORKERS     = 4
-RUN_NAME        = "v0.35"
-TEST_FRACTION   = 0.2        # fraction of meshes (UIDs) held out as unseen
-TEST_VIEW_FRACTION = 0.2     # fraction of azimuth views held out per mesh (0 = use all views)
+RUN_NAME        = "v0.37_1obj10views"
+TEST_FRACTION   = 0        # fraction of meshes (UIDs) held out as unseen
+TEST_VIEW_FRACTION = 0     # fraction of azimuth views held out per mesh (0 = use all views)
 VIS_EVERY       = 5
 VIS_SEEN        = 3
 VIS_UNSEEN      = 3
+VIS_AZIMUTHS_PER_OBJECT = 5   # how many azimuth views to visualize per UID
 VIS_RESOLUTION  = 64
 BATCH_SIZE      = 4096
 RESUME          = None
-WEIGHT_DECAY    = 1e-4
-USE_TANH_OUTPUT = True
-TARGET_SCALE_QUANTILE = 0.95
-MIN_TARGET_SCALE = 1e-3
+WEIGHT_DECAY    = 0
+USE_TANH_OUTPUT = False
+NERF_DENSITY_THRESHOLD = 25.0   # marching-cubes threshold for TripoSR decoder sanity check
+USE_TRIPLANE_FEATURES  = True   # ablation: set False to zero out triplane features (PE only)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -217,7 +217,12 @@ def wandb_log_model_parameter_table(model: nn.Module) -> None:
 # ─── SDF MLP ─────────────────────────────────────────────────────────────────
 
 class SDFMLP(nn.Module):
-    """Triplane features + optional Fourier PE -> scalar signed distance."""
+    """Triplane features + optional Fourier PE -> scalar signed distance.
+
+    The triplane block and the Fourier PE block are LayerNormed independently
+    before being concatenated, so the two very-different-statistics inputs do
+    not drown each other out inside a single LayerNorm.
+    """
 
     def __init__(
         self,
@@ -225,10 +230,21 @@ class SDFMLP(nn.Module):
         hidden_dim: int = 256,
         n_hidden: int = 3,
         use_tanh_output: bool = False,
+        feat_dim: int | None = None,
+        pe_dim: int = 0,
     ):
         super().__init__()
+        if feat_dim is None:
+            feat_dim = in_dim - pe_dim
+        assert feat_dim + pe_dim == in_dim, (
+            f"feat_dim ({feat_dim}) + pe_dim ({pe_dim}) must equal in_dim ({in_dim})"
+        )
+        self.feat_dim = feat_dim
+        self.pe_dim = pe_dim
+        self.feat_ln = nn.LayerNorm(feat_dim) if feat_dim > 0 else None
+        self.pe_ln = nn.LayerNorm(pe_dim) if pe_dim > 0 else None
+
         layers: list[nn.Module] = [
-            nn.LayerNorm(in_dim),
             nn.Linear(in_dim, hidden_dim),
             nn.SiLU(),
         ]
@@ -239,6 +255,14 @@ class SDFMLP(nn.Module):
         self.use_tanh_output = use_tanh_output
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.feat_ln is not None and self.pe_ln is not None:
+            feats = self.feat_ln(x[..., : self.feat_dim])
+            pe = self.pe_ln(x[..., self.feat_dim :])
+            x = torch.cat([feats, pe], dim=-1)
+        elif self.pe_ln is not None:
+            x = self.pe_ln(x)
+        else:
+            x = self.feat_ln(x)
         out = self.net(x).squeeze(-1)
         if self.use_tanh_output:
             out = torch.tanh(out)
@@ -323,18 +347,6 @@ def load_and_normalize_mesh(path: str, radius: float):
     return mesh
 
 
-def apply_mesh_normalization_transform(
-    pts: np.ndarray,
-    centroid: np.ndarray,
-    longest: float,
-    radius: float,
-) -> np.ndarray:
-    """``p_norm = (p_raw - centroid) * (1.0 / longest)`` — same as ``load_and_normalize_mesh``."""
-    s = 1.0 / float(longest)
-    c = np.asarray(centroid, dtype=np.float64)
-    return (np.asarray(pts, dtype=np.float64) - c) * s
-
-
 def rotate_mesh_z(mesh, angle_deg: float):
     import trimesh
     R = trimesh.transformations.rotation_matrix(np.radians(angle_deg), [0, 0, 1])
@@ -347,7 +359,7 @@ def _tripo_recon_rotation_to_pyrender_world(T_camera_to_world: np.ndarray) -> np
     """Same convention as ``render_to_triposr.py``: p_world_row = p_recon_row @ R."""
     return np.stack(
         [T_camera_to_world[:3, 2], T_camera_to_world[:3, 0], T_camera_to_world[:3, 1]],
-        axis=1,
+        axis=0,
     )
 
 
@@ -435,41 +447,34 @@ def compute_sdf(mesh, points: np.ndarray) -> np.ndarray:
 
 
 def sample_query_points(
-    raw_mesh,
+    mesh,
     n_points: int,
     radius: float,
-    centroid: np.ndarray,
-    longest: float,
     near_surface_fraction: float = 0.5,
     near_surface_std: float | None = None,
 ) -> np.ndarray:
-    """Sample in **raw** mesh coordinates, then apply the same translate+scale as
-    ``load_and_normalize_mesh``. Optional ``near_surface_std`` is Gaussian noise **in raw units**;
-    if ``None``, uses the same blur as the old ``radius * 0.04`` in normalized space.
-    """
-    s = (2.0 * radius) / float(longest)
+    """Sample query points directly in normalized mesh coordinates."""
     if near_surface_std is None:
-        near_surface_std = float((radius * 0.04) / s)
+        near_surface_std = float(radius * 0.04)
     n_near = int(n_points * near_surface_fraction)
     n_uniform = n_points - n_near
-    lo, hi = raw_mesh.bounds[0], raw_mesh.bounds[1]
+    lo, hi = mesh.bounds[0], mesh.bounds[1]
     uniform = np.stack(
         [np.random.uniform(lo[i], hi[i], n_uniform) for i in range(3)],
         axis=1,
     )
-    if len(raw_mesh.vertices) > 0 and n_near > 0:
-        idx = np.random.choice(len(raw_mesh.vertices), n_near, replace=True)
-        verts = np.asarray(raw_mesh.vertices[idx], dtype=np.float64)
+    if len(mesh.vertices) > 0 and n_near > 0:
+        idx = np.random.choice(len(mesh.vertices), n_near, replace=True)
+        verts = np.asarray(mesh.vertices[idx], dtype=np.float64)
         noise = np.random.normal(0.0, near_surface_std, (n_near, 3))
-        near_raw = verts + noise
+        near = verts + noise
     else:
-        near_raw = np.stack(
+        near = np.stack(
             [np.random.uniform(lo[i], hi[i], n_near) for i in range(3)],
             axis=1,
         )
-    raw_pts = np.concatenate([uniform, near_raw], axis=0)
-    out = apply_mesh_normalization_transform(raw_pts, centroid, longest, radius)
-    return np.clip(out.astype(np.float32), -radius, radius)
+    pts = np.concatenate([uniform, near], axis=0).astype(np.float32)
+    return np.clip(pts, -radius, radius)
 
 
 # ─── Rendering ────────────────────────────────────────────────────────────────
@@ -532,12 +537,14 @@ def render_mesh_to_image(
             distance=float(distance),
             fov_deg=float(fov),
         )
-    r = pyrender.OffscreenRenderer(size, size)
+    # Match render_to_triposr.py: render at 2x and Lanczos-downsample for free AA.
+    render_size = int(size) * 2
+    r = pyrender.OffscreenRenderer(render_size, render_size)
     color, _ = r.render(scene)
     r.delete()
     scene.clear()
     del scene
-    return Image.fromarray(color)
+    return Image.fromarray(color).resize((int(size), int(size)), Image.LANCZOS)
 
 
 # ─── Objaverse helpers ────────────────────────────────────────────────────────
@@ -575,6 +582,127 @@ def download_mesh(uid: str, cache_dir: str) -> str:
 
 
 # ─── PRECOMPUTE phase ─────────────────────────────────────────────────────────
+
+def _decode_saved_triplane_to_mesh(
+    sample_dir: Path,
+    model,
+    device: str,
+    mc_resolution: int,
+) -> Path | None:
+    """Decode ``triplane.pt`` with the original TripoSR decoder + marching cubes.
+
+    This validates the exact tensor saved during precompute. Returns the path to
+    ``triposr_mesh.obj`` on success, otherwise ``None``.
+    """
+    target = sample_dir / "triposr_mesh.obj"
+    if target.exists() and target.stat().st_size > 0:
+        return target
+    triplane_path = sample_dir / "triplane.pt"
+    if not triplane_path.exists():
+        print(f"[viewer] Cannot decode triplane: {triplane_path} missing.")
+        return None
+    # try:
+    triplane = torch.load(triplane_path, map_location="cpu")
+    # triplane = torch.load("/home/markiv/TripoSR/render_output/0/triplane.pt", map_location="cpu", weights_only=False)
+    if not isinstance(triplane, torch.Tensor):
+        raise TypeError(f"Expected tensor in {triplane_path}, got {type(triplane)}")
+    scene_codes = triplane.float()
+    if scene_codes.ndim == 4:
+        scene_codes = scene_codes.unsqueeze(0)
+    if scene_codes.ndim != 5:
+        raise ValueError(f"Unexpected triplane shape {tuple(scene_codes.shape)}")
+    scene_codes = scene_codes.to(device)
+
+    # Try the default threshold first, then a few fallback thresholds for
+    # views whose density field is too sparse at 25.0.
+    thresholds = [25.0, 15.0, 8.0, 2.0, 0.0, -2.0]
+    last_err = None
+    # print(scene_codes)
+    for thr in thresholds:
+        try:
+            last_err = None
+            # with torch.no_grad():
+            meshes = model.extract_mesh(
+                scene_codes,
+                has_vertex_color=False,
+                resolution=mc_resolution,
+                threshold=float(thr),
+            )
+            if not meshes:
+                continue
+            mesh = meshes[0]
+            if len(mesh.faces) == 0:
+                continue
+            mesh.export(str(target))
+            return target
+        except Exception as e:
+            last_err = e
+            continue
+    if last_err is not None:
+        print(f"[viewer] Triplane decode failed for {sample_dir.name}: {last_err}")
+    else:
+        print(f"[viewer] Triplane decode produced no triangles for {sample_dir.name}.")
+    return None
+    # except Exception as e:
+    #     print(f"[viewer] Failed reading/decoding triplane for {sample_dir.name}: {e}")
+    #     return None
+
+
+def _launch_precompute_viewer(samples_dir: Path, model, device: str, mc_resolution: int) -> None:
+    """Open a Gradio viewer comparing the source mesh with the TripoSR MLP output.
+
+    Picks the lexicographically-first completed sample and decodes its saved
+    ``triplane.pt`` through the original TripoSR decoder.
+    """
+    try:
+        from view_mesh import launch_multi_viewer
+    except ImportError as e:
+        print(f"[viewer] Skipping: could not import view_mesh.launch_multi_viewer ({e}).")
+        return
+
+    if not samples_dir.exists():
+        print(f"[viewer] Skipping: {samples_dir} does not exist.")
+        return
+
+    candidates = sorted(
+        sd for sd in samples_dir.iterdir()
+        if sd.is_dir()
+        and not sd.name.startswith("_tmp")
+        and (sd / "source_mesh.obj").exists()
+        and (sd / "input_view.png").exists()
+        and (sd / "triplane.pt").exists()
+    )
+    if not candidates:
+        print("[viewer] Skipping: no completed samples with source_mesh.obj + input_view.png + triplane.pt found.")
+        return
+
+    print(f"[viewer] Decoding {len(candidates)} triplane(s) for sanity-check viewer ...")
+    viewer_samples: list[dict] = []
+    for sample_dir in candidates:
+        triposr_mesh_path = _decode_saved_triplane_to_mesh(sample_dir, model, device, mc_resolution)
+        if triposr_mesh_path is None:
+            print(f"[viewer] Skipping {sample_dir.name}: triplane decode failed.")
+            continue
+        render_image = sample_dir / "input_view.png"
+        extrinsics = sample_dir / "camera_extrinsics.json"
+        viewer_samples.append({
+            "name": sample_dir.name,
+            "mesh_path": str(triposr_mesh_path),
+            "source_mesh_path": str(sample_dir / "source_mesh.obj"),
+            "render_image_path": str(render_image) if render_image.exists() else None,
+            "output_dir": str(sample_dir),
+            "camera_extrinsics_path": str(extrinsics) if extrinsics.exists() else None,
+            # source_mesh.obj was already normalized during precompute.
+            "normalize_source_to_unit_cube": False,
+        })
+
+    if not viewer_samples:
+        print("[viewer] Skipping: no samples decoded successfully.")
+        return
+
+    print(f"[viewer] Launching multi-sample viewer with {len(viewer_samples)} sample(s).")
+    launch_multi_viewer(viewer_samples)
+
 
 def run_precompute(args: argparse.Namespace) -> None:
     dataset_dir = Path(args.dataset_dir)
@@ -640,6 +768,7 @@ def run_precompute(args: argparse.Namespace) -> None:
                     "query_pts.pt",
                     "sdf_gt.pt",
                     "camera_extrinsics.json",
+                    "source_mesh.obj",
                 ))
             for az in azimuths
         ]
@@ -659,7 +788,7 @@ def run_precompute(args: argparse.Namespace) -> None:
                     pbar.set_postfix(objects=obj_saved, skipped=obj_skipped)
                     continue
             raw = _load_trimesh(mesh_path)
-            mesh, centroid, longest = _normalize_mesh_copy(raw, radius)
+            mesh, _, _ = _normalize_mesh_copy(raw, radius)
             if not mesh.is_watertight:
                 obj_skipped += 1
                 pbar.set_postfix(objects=obj_saved, skipped=obj_skipped)
@@ -681,7 +810,10 @@ def run_precompute(args: argparse.Namespace) -> None:
             try:
                 tmp_dir = sample_dir.parent / f"_tmp_{sample_id}"
                 tmp_dir.mkdir(parents=True, exist_ok=True)
-                image = render_mesh_to_image(
+
+                # 1. Render the normalized source mesh to an image (saved to disk
+                #    first so that we re-load it the same way ``run.py`` does).
+                pil_image = render_mesh_to_image(
                     mesh,
                     elevation=args.elevation,
                     fov=args.fov,
@@ -689,31 +821,53 @@ def run_precompute(args: argparse.Namespace) -> None:
                     azimuth=float(az),
                     extrinsics_json_path=tmp_dir / "camera_extrinsics.json",
                 )
+                input_png_path = tmp_dir / "input_view.png"
+                pil_image.save(input_png_path)
 
+                # 2. Re-load the PNG as an RGB NumPy array -- byte-identical to
+                #    ``run.py --no-remove-bg`` / ``render_to_triposr.py`` so that
+                #    any downstream failure cannot be attributed to a different
+                #    image representation.
+                image_np = np.array(Image.open(input_png_path).convert("RGB"))
+
+                # 3. Run TripoSR to get the triplane (scene_codes).
                 with torch.no_grad():
-                    scene_codes = model([image], device=device)
+                    scene_codes = model([image_np], device=device)
                 triplane = scene_codes[0].half().cpu()
 
+                # 4. Sample query points in the normalized mesh frame and
+                #    compute signed distances against the source mesh.
                 query_pts_np = sample_query_points(
-                    raw, args.n_points, radius, centroid, longest
+                    mesh, args.n_points, radius
                 )
                 sdf_gt_np = compute_sdf(mesh, query_pts_np)
 
+                # 5. Persist the core tensors used by training. The decoded
+                #    sanity-check mesh (``triposr_mesh.obj``) is produced later,
+                #    on-demand, via ``run.py`` subprocess -- the exact same path
+                #    ``render_to_triposr.py`` uses.
                 torch.save(triplane, tmp_dir / "triplane.pt")
                 torch.save(torch.from_numpy(query_pts_np), tmp_dir / "query_pts.pt")
                 torch.save(torch.from_numpy(sdf_gt_np), tmp_dir / "sdf_gt.pt")
-                image.save(tmp_dir / "input_view.png")
+                mesh.export(str(tmp_dir / "source_mesh.obj"))
+
                 tmp_dir.rename(sample_dir)
 
                 pbar.set_postfix(objects=obj_saved, skipped=obj_skipped, uid=uid[:8])
 
-                del image, scene_codes, triplane
+                del pil_image, image_np, scene_codes, triplane
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 gc.collect()
 
             except Exception as e:
                 if args.verbose:
+                    import traceback
+                    tqdm.write(
+                        f"[skip sample] {sample_id}: {e}\n"
+                        + traceback.format_exc()
+                    )
+                else:
                     tqdm.write(f"[skip sample] {sample_id}: {e}")
 
         obj_saved += 1
@@ -727,6 +881,15 @@ def run_precompute(args: argparse.Namespace) -> None:
     total_samples = obj_saved * args.azimuths_per_mesh
     print(f"\nPrecompute done — {obj_saved} objects ({total_samples} samples), "
           f"{obj_skipped} skipped -> {dataset_dir}")
+
+    if getattr(args, "launch_viewer_after_precompute", False):
+        _launch_precompute_viewer(samples_dir, model, device, args.mc_resolution)
+
+    # Free the TripoSR model after optional sanity-check decoding/viewing.
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
 
 
 # ─── Dataset ──────────────────────────────────────────────────────────────────
@@ -801,12 +964,11 @@ class SDFPointDataset(Dataset):
         self.all_feats = torch.cat(feats_list, dim=0)
         self.point_sample_id = torch.cat(sid_list, dim=0)
         self.sample_dirs = [p.parent for p in all_samples]
-        abs_sdf = self.all_sdf.abs()
-        self.sdf_scale = float(torch.quantile(abs_sdf, TARGET_SCALE_QUANTILE).item()) \
-            if abs_sdf.numel() > 0 else 1.0
-        self.sdf_scale = max(self.sdf_scale, MIN_TARGET_SCALE)
         print(f"Dataset ready: {self.all_pts.shape[0]} points, feats shape {self.all_feats.shape}")
-        print(f"SDF normalization scale (q={TARGET_SCALE_QUANTILE:.2f}): {self.sdf_scale:.6f}")
+        print(
+            "SDF targets used as-is (mesh already normalized to unit cube in precompute; "
+            f"|sdf| in [0, {self.all_sdf.abs().max().item():.4f}])"
+        )
 
     def __len__(self) -> int:
         return self.all_pts.shape[0]
@@ -896,6 +1058,7 @@ def reconstruct_mesh_from_triplane(
     device: torch.device = None,
     n_freqs: int = 0,
     R_world_from_trip: np.ndarray | None = None,
+    use_triplane_features: bool = True,
 ):
     """Run marching cubes on a dense SDF grid in TripoSR coords; optional ``R`` maps verts to mesh world."""
     import trimesh as tr
@@ -912,9 +1075,12 @@ def reconstruct_mesh_from_triplane(
     with torch.no_grad():
         for i in range(0, len(grid_pts), batch_size):
             batch = grid_pts[i : i + batch_size].to(device)
-            feats = query_triplane_features(batch, triplane_dev, radius, feature_reduction)
-            if n_freqs > 0:
-                feats = torch.cat([feats, fourier_encode(batch, n_freqs)], dim=-1)
+            if use_triplane_features:
+                feats = query_triplane_features(batch, triplane_dev, radius, feature_reduction)
+                if n_freqs > 0:
+                    feats = torch.cat([feats, fourier_encode(batch, n_freqs)], dim=-1)
+            else:
+                feats = fourier_encode(batch, n_freqs) if n_freqs > 0 else batch
             all_sdfs.append(sdf_mlp(feats).cpu())
 
     sdf_vol = torch.cat(all_sdfs).numpy().reshape(resolution, resolution, resolution)
@@ -932,6 +1098,128 @@ def reconstruct_mesh_from_triplane(
     return tr.Trimesh(vertices=verts, faces=faces, vertex_normals=normals)
 
 
+def reconstruct_mesh_nerf_decoder(
+    triposr_decoder: nn.Module,
+    triplane: torch.Tensor,
+    radius: float,
+    feature_reduction: str,
+    density_activation: str,
+    density_bias: float,
+    resolution: int = 64,
+    batch_size: int = 32768,
+    threshold: float = 25.0,
+    device: torch.device = None,
+    R_world_from_trip: np.ndarray | None = None,
+):
+    """Run TripoSR's original NeRF decoder on a grid and extract a mesh via marching cubes.
+
+    When R_world_from_trip is provided, applies verts @ R.T to rotate from the
+    camera-centric TripoSR frame back to GT mesh orientation (inverse of the
+    R that maps GT frame → camera-centric frame, i.e. the transform training uses
+    in reverse).
+    """
+    import trimesh as tr
+
+    if device is None:
+        device = next(triposr_decoder.parameters()).device
+
+    coords = torch.linspace(-radius, radius, resolution)
+    xx, yy, zz = torch.meshgrid(coords, coords, coords, indexing="ij")
+    grid_pts = torch.stack([xx, yy, zz], dim=-1).reshape(-1, 3)
+
+    triplane_dev = triplane.to(device)
+    act_fn = get_activation(density_activation)
+    all_density: list[torch.Tensor] = []
+
+    with torch.no_grad():
+        for i in range(0, len(grid_pts), batch_size):
+            batch = grid_pts[i : i + batch_size].to(device)
+            feats = query_triplane_features(batch, triplane_dev, radius, feature_reduction)
+            raw = triposr_decoder(feats)["density"].squeeze(-1)
+            all_density.append(act_fn(raw + density_bias).cpu())
+
+    density_vol = torch.cat(all_density).numpy().reshape(resolution, resolution, resolution)
+
+    try:
+        verts, faces, normals, _ = marching_cubes(-(density_vol - threshold), level=0.0)
+    except ValueError:
+        return None
+
+    voxel_size = (2.0 * radius) / (resolution - 1)
+    verts = verts * voxel_size - radius
+    if R_world_from_trip is not None:
+        R = np.asarray(R_world_from_trip, dtype=np.float64)
+        verts = verts @ R
+    return tr.Trimesh(vertices=verts, faces=faces, vertex_normals=normals)
+
+
+def compute_nerf_vs_sdf_stats(
+    triposr_decoder: nn.Module,
+    triplane: torch.Tensor,
+    query_pts: torch.Tensor,
+    sdf_gt: torch.Tensor,
+    R_world_from_trip: np.ndarray,
+    radius: float,
+    feature_reduction: str,
+    density_activation: str,
+    density_bias: float,
+    threshold: float = 25.0,
+    batch_size: int = 4096,
+    device: torch.device = None,
+) -> dict:
+    """Compare NeRF decoder density to GT SDF at precomputed query points.
+
+    query_pts and sdf_gt are in mesh/world frame (as saved by precompute).
+    Points are rotated into TripoSR frame before triplane lookup.
+
+    The key diagnostic: if the coordinate frame is correct, NeRF density should
+    be high (> threshold) exactly where GT SDF is negative (inside the mesh).
+    occupancy_accuracy measures this directly.  The per-bin density table shows
+    how density varies with GT distance from surface.
+    """
+    if device is None:
+        device = next(triposr_decoder.parameters()).device
+
+    R = torch.from_numpy(R_world_from_trip).float()
+    pts_trip = (query_pts.float() @ R.T)             # mesh frame → TripoSR frame
+
+    triplane_dev = triplane.to(device)
+    act_fn = get_activation(density_activation)
+    all_density: list[torch.Tensor] = []
+
+    with torch.no_grad():
+        for i in range(0, len(pts_trip), batch_size):
+            batch = pts_trip[i : i + batch_size].to(device)
+            feats = query_triplane_features(batch, triplane_dev, radius, feature_reduction)
+            raw = triposr_decoder(feats)["density"].squeeze(-1)
+            all_density.append(act_fn(raw + density_bias).cpu())
+
+    density = torch.cat(all_density).numpy()
+    sdf = sdf_gt.numpy()
+
+    # Occupancy accuracy: (density > threshold) should match (sdf < 0)
+    pred_inside = density > threshold
+    gt_inside   = sdf < 0
+    occupancy_accuracy = float((pred_inside == gt_inside).mean())
+
+    # MSE per SDF-distance bin — shows where the density mismatch is worst
+    bin_edges  = [-np.inf, -0.1, -0.02, 0.0, 0.02, 0.1, np.inf]
+    bin_labels = ["< -0.1", "-0.1→-0.02", "-0.02→0", "0→0.02", "0.02→0.1", "> 0.1"]
+    bin_mse: dict[str, float] = {}
+    for lo, hi, lbl in zip(bin_edges[:-1], bin_edges[1:], bin_labels):
+        mask = (sdf > lo) & (sdf <= hi)
+        if mask.any():
+            bin_mse[lbl] = float(((pred_inside[mask].astype(float) - gt_inside[mask].astype(float)) ** 2).mean())
+
+    return {
+        "occupancy_accuracy": occupancy_accuracy,
+        "density_mean":         float(density.mean()),
+        "density_max":          float(density.max()),
+        "density_surface_mean": float(density[np.abs(sdf) < 0.02].mean()) if (np.abs(sdf) < 0.02).any() else float("nan"),
+        "bin_occupancy_mse":    bin_mse,
+    }
+
+
 def create_mesh_comparison_visualization(
     gt_mesh,
     pred_mesh,
@@ -940,6 +1228,7 @@ def create_mesh_comparison_visualization(
     phi_values: tuple = (45, 135, 225, 315),
     theta_deg: float = 50.0,
     input_image=None,
+    nerf_mesh=None,
 ) -> Path:
     from matplotlib.gridspec import GridSpec
 
@@ -947,13 +1236,19 @@ def create_mesh_comparison_visualization(
                                    base_color=(0.6, 0.7, 0.85))
     pred_renders = render_mesh_views(pred_mesh, phi_values=phi_values, theta_deg=theta_deg,
                                      base_color=(0.85, 0.6, 0.6))
+    nerf_renders = (
+        render_mesh_views(nerf_mesh, phi_values=phi_values, theta_deg=theta_deg,
+                          base_color=(0.6, 0.85, 0.65))
+        if nerf_mesh is not None else None
+    )
 
     n = len(phi_values)
-    n_rows = 3 if input_image is not None else 2
-    fig_h = 4 * n_rows
-    fig = plt.figure(figsize=(4 * n, fig_h))
+    n_mesh_rows = 2 + (1 if nerf_renders is not None else 0)
+    n_rows = n_mesh_rows + (1 if input_image is not None else 0)
+    fig = plt.figure(figsize=(4 * n, 4 * n_rows))
     gs = GridSpec(n_rows, n, figure=fig, hspace=0.35, wspace=0.05)
 
+    row_offset = 0
     if input_image is not None:
         span = min(2, n)
         start = (n - span) // 2
@@ -964,24 +1259,38 @@ def create_mesh_comparison_visualization(
         for col in range(n):
             if not (start <= col < start + span):
                 fig.add_subplot(gs[0, col]).axis("off")
-        gt_row, pred_row = 1, 2
-    else:
-        gt_row, pred_row = 0, 1
+        row_offset = 1
+
+    gt_row   = row_offset
+    nerf_row = row_offset + 1
+    pred_row = row_offset + (2 if nerf_renders is not None else 1)
 
     for i, img in enumerate(gt_renders):
         ax = fig.add_subplot(gs[gt_row, i])
         ax.imshow(img)
         ax.set_title(f"GT  phi={phi_values[i]}", fontsize=10)
         ax.axis("off")
+
+    if nerf_renders is not None:
+        for i, img in enumerate(nerf_renders):
+            ax = fig.add_subplot(gs[nerf_row, i])
+            ax.imshow(img)
+            ax.set_title(f"NeRF dec  phi={phi_values[i]}", fontsize=10)
+            ax.axis("off")
+
     for i, img in enumerate(pred_renders):
         ax = fig.add_subplot(gs[pred_row, i])
         ax.imshow(img)
-        ax.set_title(f"Pred  phi={phi_values[i]}", fontsize=10)
+        ax.set_title(f"SDF MLP  phi={phi_values[i]}", fontsize=10)
         ax.axis("off")
 
-    stats = (f"GT:   {len(gt_mesh.vertices):,}v  {len(gt_mesh.faces):,}f\n"
-             f"Pred: {len(pred_mesh.vertices):,}v  {len(pred_mesh.faces):,}f")
-    fig.text(0.01, 0.01, stats, fontsize=9, family="monospace",
+    stats_lines = [
+        f"GT:      {len(gt_mesh.vertices):,}v  {len(gt_mesh.faces):,}f",
+        f"SDF MLP: {len(pred_mesh.vertices):,}v  {len(pred_mesh.faces):,}f",
+    ]
+    if nerf_mesh is not None:
+        stats_lines.insert(1, f"NeRF dec:{len(nerf_mesh.vertices):,}v  {len(nerf_mesh.faces):,}f")
+    fig.text(0.01, 0.01, "\n".join(stats_lines), fontsize=9, family="monospace",
              bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
     fig.suptitle(title, fontsize=13, fontweight="bold")
 
@@ -1008,8 +1317,16 @@ def visualize_reconstructions(
     elevation: float = 30.0,
     fov: float = 40.0,
     image_size: int = 256,
+    triposr_decoder: nn.Module | None = None,
+    density_activation: str = "exp",
+    density_bias: float = -1.0,
+    nerf_threshold: float = 25.0,
+    use_triplane_features: bool = True,
 ) -> None:
     sdf_mlp.eval()
+
+    # Accumulate gradient stats across all vis samples for a single wandb log.
+    all_grad_stats: list[dict] = []
 
     for label, sample_dirs in (("seen", seen_dirs), ("unseen", unseen_dirs)):
         for sample_dir in sample_dirs:
@@ -1029,6 +1346,7 @@ def visualize_reconstructions(
                     device=device,
                     n_freqs=n_freqs,
                     R_world_from_trip=R_np,
+                    use_triplane_features=use_triplane_features,
                 )
                 if pred_mesh is None:
                     tqdm.write(f"[vis] marching cubes failed for {uid}")
@@ -1053,30 +1371,103 @@ def visualize_reconstructions(
                 )
                 input_image = np.array(input_pil)
 
+                # ── TripoSR decoder sanity checks ─────────────────────────────
+                nerf_mesh = None
+                if triposr_decoder is not None:
+                    try:
+                        nerf_mesh = reconstruct_mesh_nerf_decoder(
+                            triposr_decoder,
+                            triplane,
+                            radius,
+                            feature_reduction,
+                            density_activation,
+                            density_bias,
+                            resolution=resolution,
+                            threshold=nerf_threshold,
+                            device=device,
+                            R_world_from_trip=R_np,
+                        )
+                        if nerf_mesh is None:
+                            tqdm.write(f"[vis] NeRF decoder marching cubes failed for {uid}")
+                    except Exception as e:
+                        tqdm.write(f"[vis] NeRF decoder mesh failed for {uid}: {e}")
+
+                    try:
+                        query_pts_disk = torch.load(
+                            sample_dir / "query_pts.pt", map_location="cpu", weights_only=False
+                        )
+                        sdf_gt_disk = torch.load(
+                            sample_dir / "sdf_gt.pt", map_location="cpu", weights_only=False
+                        )
+                        nerf_stats = compute_nerf_vs_sdf_stats(
+                            triposr_decoder,
+                            triplane,
+                            query_pts_disk,
+                            sdf_gt_disk,
+                            R_np,
+                            radius,
+                            feature_reduction,
+                            density_activation,
+                            density_bias,
+                            threshold=nerf_threshold,
+                            device=device,
+                        )
+                        nerf_stats["_uid"] = uid
+                        nerf_stats["_label"] = label
+                        all_grad_stats.append(nerf_stats)
+                        tqdm.write(
+                            f"[vis] {uid[:12]} occ_acc={nerf_stats['occupancy_accuracy']:.3f} "
+                            f"density_surface={nerf_stats['density_surface_mean']:.2f} "
+                            f"density_max={nerf_stats['density_max']:.1f}"
+                        )
+                    except Exception as e:
+                        tqdm.write(f"[vis] nerf vs sdf stats failed for {uid}: {e}")
+
                 save_path = output_dir / label / f"{uid}_epoch{epoch:04d}.png"
                 create_mesh_comparison_visualization(
                     gt_mesh, pred_mesh,
                     title=f"{label} - {uid[:12]} - epoch {epoch}",
                     save_path=save_path,
                     input_image=input_image,
+                    nerf_mesh=nerf_mesh,
                 )
 
                 if wandb_enabled:
                     try:
                         wandb.log({
-                            f"mesh_reconstruction/{label}/{uid[:12]}": wandb.Image(str(save_path)),
+                            f"mesh_reconstruction/{label}/{sample_dir.name}": wandb.Image(str(save_path)),
                             "mesh_reconstruction/epoch": epoch,
                         })
                     except Exception:
                         pass
 
-                del triplane, pred_mesh, gt_mesh
+                del triplane, pred_mesh, gt_mesh, nerf_mesh
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
             except Exception as e:
                 tqdm.write(f"[vis] failed for {uid}: {e}")
+
+    # ── Log aggregated NeRF-vs-SDF stats to wandb ────────────────────────────
+    if wandb_enabled and all_grad_stats and triposr_decoder is not None:
+        try:
+            agg = {
+                "nerf_sanity/occupancy_accuracy":   np.mean([s["occupancy_accuracy"]   for s in all_grad_stats]),
+                "nerf_sanity/density_surface_mean": np.nanmean([s["density_surface_mean"] for s in all_grad_stats]),
+                "nerf_sanity/density_max_mean":     np.mean([s["density_max"]           for s in all_grad_stats]),
+                "nerf_sanity/epoch": epoch,
+            }
+            # Per-bin occupancy MSE: average across samples for each bin label
+            all_bins: dict[str, list[float]] = {}
+            for s in all_grad_stats:
+                for lbl, val in s["bin_occupancy_mse"].items():
+                    all_bins.setdefault(lbl, []).append(val)
+            for lbl, vals in all_bins.items():
+                agg[f"nerf_sanity/bin_mse/{lbl}"] = float(np.mean(vals))
+            wandb.log(agg)
+        except Exception as e:
+            tqdm.write(f"[vis] wandb nerf stats log failed: {e}")
 
     sdf_mlp.train()
 
@@ -1122,12 +1513,30 @@ def run_train(args: argparse.Namespace) -> None:
     radius: float = meta["radius"]
     feature_reduction: str = meta["feature_reduction"]
     feat_dim: int = meta["feat_dim"]
-    sdf_scale: float = dataset.sdf_scale
     R_stack_device = dataset.R_stack.to(device)
+
+    # ── Load frozen TripoSR decoder for sanity-check visualizations ───────────
+    triposr_decoder: nn.Module | None = None
+    _density_activation = "exp"
+    _density_bias = -1.0
+    try:
+        from tsr.system import TSR
+        _full = TSR.from_pretrained(args.model, config_name="config.yaml", weight_name="model.ckpt")
+        triposr_decoder = _full.decoder.to(device).eval()
+        for p in triposr_decoder.parameters():
+            p.requires_grad_(False)
+        _density_activation = _full.renderer.cfg.density_activation
+        _density_bias = float(_full.renderer.cfg.density_bias)
+        del _full
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print(f"TripoSR decoder loaded (density_activation={_density_activation}, bias={_density_bias})")
+    except Exception as e:
+        print(f"Warning: could not load TripoSR decoder ({e}). NeRF sanity checks disabled.")
 
     print(f"Dataset: {len(dataset)} points | "
           f"{n_test} unseen UIDs, {len(test_view_names)} unseen views | "
-          f"radius={radius:.4f} | feat_dim={feat_dim} | sdf_scale={sdf_scale:.6f}")
+          f"radius={radius:.4f} | feat_dim={feat_dim}")
 
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
                         num_workers=args.num_workers, pin_memory=True, drop_last=True)
@@ -1139,13 +1548,9 @@ def run_train(args: argparse.Namespace) -> None:
         chosen = random.Random(0).sample(sorted(uid_set), min(n, len(uid_set)))
         dirs = []
         for uid in chosen:
-            az0 = dataset_dir / "samples" / f"{uid}_az000"
-            if az0.exists():
-                dirs.append(az0)
-            else:
-                candidates = sorted((dataset_dir / "samples").glob(f"{uid}_az*"))
-                if candidates:
-                    dirs.append(candidates[0].parent)
+            candidates = sorted((dataset_dir / "samples").glob(f"{uid}_az*"))
+            for c in candidates[: args.vis_azimuths_per_object]:
+                dirs.append(c)
         return dirs
 
     def _pick_vis_from_names(name_set: set, n: int) -> list:
@@ -1162,17 +1567,26 @@ def run_train(args: argparse.Namespace) -> None:
     # ── Model ─────────────────────────────────────────────────────────────────
     n_freqs: int = args.n_freqs
     pe_dim: int = (3 + 6 * n_freqs) if n_freqs > 0 else 0
-    mlp_in_dim: int = feat_dim + pe_dim
-    print(f"MLP input: {feat_dim}-dim triplane feats + {pe_dim}-dim PE = {mlp_in_dim}")
+    if args.use_triplane_features:
+        mlp_feat_dim = feat_dim
+        mlp_hidden_dim = args.hidden_dim
+    else:
+        mlp_feat_dim = 0
+        mlp_hidden_dim = args.hidden_dim_no_triplane
+    mlp_in_dim: int = mlp_feat_dim + pe_dim
+    print(f"MLP input: {mlp_feat_dim}-dim triplane feats + {pe_dim}-dim PE = {mlp_in_dim}"
+          + ("" if args.use_triplane_features else f"  [PE-only ablation, hidden_dim={mlp_hidden_dim}]"))
 
     global MLP_IN_DIM
     MLP_IN_DIM = mlp_in_dim
 
     sdf_mlp = SDFMLP(
         in_dim=mlp_in_dim,
-        hidden_dim=args.hidden_dim,
+        hidden_dim=mlp_hidden_dim,
         n_hidden=args.n_hidden,
         use_tanh_output=args.use_tanh_output,
+        feat_dim=mlp_feat_dim,
+        pe_dim=pe_dim,
     ).to(device)
     optimizer = torch.optim.AdamW(sdf_mlp.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -1192,7 +1606,6 @@ def run_train(args: argparse.Namespace) -> None:
             "feat_dim": feat_dim,
             "mlp_in_dim": mlp_in_dim,
             "pe_dim": pe_dim,
-            "sdf_scale": sdf_scale,
             "total_dataset_points": len(dataset),
             "loader_batches_per_epoch": len(loader),
             "n_train_uids": len(train_uids),
@@ -1247,25 +1660,26 @@ def run_train(args: argparse.Namespace) -> None:
         pbar.set_description(f"Epoch {epoch + 1}/{args.epochs}")
 
         for base_feats, query_pts, sdf_gt, sid in loader:
-            base_feats = base_feats.to(device)
             query_pts = query_pts.to(device).requires_grad_(True)
             sdf_gt = sdf_gt.to(device)
             sid = sid.to(device)
 
             if n_freqs > 0:
-                trip = query_pts.clone()
                 Rs = R_stack_device
+                trip = query_pts.detach()
                 for u in sid.unique():
                     m = sid == u
-                    Ru = Rs[u.long()]
-                    trip[m] = query_pts[m] @ Ru.T
-                model_feats = torch.cat([base_feats, fourier_encode(trip, n_freqs)], dim=-1)
+                    trip = trip.clone()
+                    trip[m] = query_pts[m] @ Rs[u.long()].T
+                if args.use_triplane_features:
+                    model_feats = torch.cat([base_feats.to(device), fourier_encode(trip, n_freqs)], dim=-1)
+                else:
+                    model_feats = fourier_encode(trip, n_freqs)
             else:
-                model_feats = base_feats
+                model_feats = base_feats.to(device) if args.use_triplane_features else torch.empty(0)
 
             sdf_pred = sdf_mlp(model_feats)
-            sdf_gt_norm = (sdf_gt / sdf_scale).clamp(-1.0, 1.0)
-            sdf_loss = F.mse_loss(sdf_pred, sdf_gt_norm)
+            sdf_loss = F.mse_loss(sdf_pred, sdf_gt)
 
             gradients = torch.autograd.grad(
                 outputs=sdf_pred,
@@ -1293,8 +1707,8 @@ def run_train(args: argparse.Namespace) -> None:
             grad_max_val = float(grad_norm.max().detach().item())
             pred_min_val = float(sdf_pred.min().detach().item())
             pred_max_val = float(sdf_pred.max().detach().item())
-            tgt_min_val = float(sdf_gt_norm.min().detach().item())
-            tgt_max_val = float(sdf_gt_norm.max().detach().item())
+            tgt_min_val = float(sdf_gt.min().detach().item())
+            tgt_max_val = float(sdf_gt.max().detach().item())
             diag_grad_mean_sum += grad_mean_val
             diag_grad_min = min(diag_grad_min, grad_min_val)
             diag_grad_max = max(diag_grad_max, grad_max_val)
@@ -1354,7 +1768,6 @@ def run_train(args: argparse.Namespace) -> None:
                 "optimizer": optimizer.state_dict(),
                 "meta": meta,
                 "args": vars(args),
-                "sdf_scale": sdf_scale,
             }, ckpt_path)
 
         if args.vis_every > 0 and (epoch + 1) % args.vis_every == 0:
@@ -1374,6 +1787,11 @@ def run_train(args: argparse.Namespace) -> None:
                 elevation=args.elevation,
                 fov=args.fov,
                 image_size=args.image_size,
+                triposr_decoder=triposr_decoder,
+                density_activation=_density_activation,
+                density_bias=_density_bias,
+                nerf_threshold=NERF_DENSITY_THRESHOLD,
+                use_triplane_features=args.use_triplane_features,
             )
 
     pbar.close()
@@ -1400,10 +1818,13 @@ def main() -> None:
         fov            = FOV,
         max_mesh_mb    = MAX_MESH_MB,
         verbose        = VERBOSE,
+        mc_resolution  = MC_RESOLUTION,
+        launch_viewer_after_precompute = LAUNCH_VIEWER_AFTER_PRECOMPUTE,
         output_dir     = OUTPUT_DIR,
         epochs         = EPOCHS,
         save_every     = SAVE_EVERY,
         hidden_dim     = HIDDEN_DIM,
+        hidden_dim_no_triplane = HIDDEN_DIM_NO_TRIPLANE,
         n_hidden       = N_HIDDEN,
         n_freqs        = N_FREQS,
         lr             = LR,
@@ -1413,11 +1834,13 @@ def main() -> None:
         run_name       = RUN_NAME,
         weight_decay   = WEIGHT_DECAY,
         use_tanh_output = USE_TANH_OUTPUT,
+        use_triplane_features = USE_TRIPLANE_FEATURES,
         test_fraction  = TEST_FRACTION,
         test_view_fraction = TEST_VIEW_FRACTION,
         vis_every      = VIS_EVERY,
         vis_seen       = VIS_SEEN,
         vis_unseen     = VIS_UNSEEN,
+        vis_azimuths_per_object = VIS_AZIMUTHS_PER_OBJECT,
         vis_resolution = VIS_RESOLUTION,
         batch_size     = BATCH_SIZE,
         resume         = RESUME,
