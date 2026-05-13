@@ -169,3 +169,5 @@ render_output
 sdf_*/
 wandb/
 features.pt
+
+infer_output/

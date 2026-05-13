@@ -17,6 +17,7 @@ Typical workflow
 
 import contextlib
 import gc
+import itertools
 import json
 import os
 import shutil
@@ -36,13 +37,16 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from einops import rearrange
 from PIL import Image
 from skimage.measure import marching_cubes
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from tsr.utils import get_activation, scale_tensor
@@ -57,44 +61,45 @@ COMMAND = "both"
 DATASET_DIR     = "/home/markiv/TripoSR/sdf_dataset"
 
 # ── Precompute ───────────────────────────────────────────────────────────────
-MODEL           = "stabilityai/TripoSR"
-N_OBJECTS       = 1
-AZIMUTHS_PER_MESH = 5
-N_POINTS        = 262144
-IMAGE_SIZE      = 256
-ELEVATION       = 30.0
-FOV             = 40.0
-MAX_MESH_MB     = 0.0
-VERBOSE         = True
-MC_RESOLUTION   = 256                  # Marching-cubes resolution for TripoSR MLP decode (sanity-check mesh)
-LAUNCH_VIEWER_AFTER_PRECOMPUTE = False
+MODEL                 = "stabilityai/TripoSR"
+N_OBJECTS             = 25
+AZIMUTHS_PER_MESH     = 5              # × len(ELEVATIONS) = 10 views per object
+ELEVATIONS            = [15.0, 30.0]   # two elevation bands; replaces single ELEVATION
+N_POINTS              = 262144         # = 64^3
+NEAR_SURFACE_FRACTION = 0.0            # fully uniform in [-radius, radius]³; mimics MC inference grid
+IMAGE_SIZE            = 256
+FOV                   = 40.0
+MAX_MESH_MB           = 0.0
+MAX_TRIANGLES         = 500_000       # skip meshes with more faces than this (BVH RAM guard)
+VERBOSE               = False
 
 # ── Train ────────────────────────────────────────────────────────────────────
 OUTPUT_DIR      = "/home/markiv/TripoSR/sdf_checkpoints"
 EPOCHS          = 500
-SAVE_EVERY      = 10
+SAVE_EVERY      = 25
 HIDDEN_DIM      = 256
-HIDDEN_DIM_NO_TRIPLANE = 256 # originally 256   # hidden dim when USE_TRIPLANE_FEATURES=False (needs more capacity)
+HIDDEN_DIM_NO_TRIPLANE = 256
 N_HIDDEN        = 10
 N_FREQS         = 6
 LR              = 1e-3
-EIKONAL_WEIGHT  = 0.0
-SDF_CLAMP       = 0.0
+EIKONAL_WEIGHT        = 1e-5
+SURFACE_LOSS_SIGMA    = 0.05   # exp(-|sdf|/sigma) weighting; ~5% of object scale
+SDF_CLAMP             = 0.0
 NUM_WORKERS     = 4
-RUN_NAME        = "v0.37_1obj10views"
-TEST_FRACTION   = 0        # fraction of meshes (UIDs) held out as unseen
-TEST_VIEW_FRACTION = 0     # fraction of azimuth views held out per mesh (0 = use all views)
-VIS_EVERY       = 5
+RUN_NAME        = "v0.41_25obj_unif"
+TEST_FRACTION   = 0.2        # fraction of meshes (UIDs) held out as unseen
+TEST_VIEW_FRACTION = 0.2     # fraction of views held out per mesh
+VIS_EVERY       = 25
 VIS_SEEN        = 3
 VIS_UNSEEN      = 3
-VIS_AZIMUTHS_PER_OBJECT = 5   # how many azimuth views to visualize per UID
+VIS_AZIMUTHS_PER_OBJECT = 5
 VIS_RESOLUTION  = 64
 BATCH_SIZE      = 4096
 RESUME          = None
 WEIGHT_DECAY    = 0
 USE_TANH_OUTPUT = False
-NERF_DENSITY_THRESHOLD = 25.0   # marching-cubes threshold for TripoSR decoder sanity check
 USE_TRIPLANE_FEATURES  = True   # ablation: set False to zero out triplane features (PE only)
+USE_NERF_VIS           = True  # load TripoSR decoder + render NeRF mesh during visualization
 
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -305,6 +310,12 @@ def query_triplane_features(
 
 # ─── Fourier positional encoding ─────────────────────────────────────────────
 
+def surface_weighted_mse_loss(pred: torch.Tensor, target: torch.Tensor, sigma: float = 0.05) -> torch.Tensor:
+    weights = torch.exp(-target.abs() / sigma)
+    weights = weights / weights.mean()
+    return (weights * (pred - target) ** 2).mean()
+
+
 def fourier_encode(pts: torch.Tensor, n_freqs: int = 6) -> torch.Tensor:
     """pts: (..., 3) -> (..., 3 + 6*n_freqs)"""
     if n_freqs == 0:
@@ -438,12 +449,32 @@ def load_R_world_from_recon_json_strict(sample_dir: Path) -> np.ndarray:
     return R
 
 
-def compute_sdf(mesh, points: np.ndarray) -> np.ndarray:
-    """Signed distance: negative inside, positive outside."""
+def compute_sdf(mesh, points: np.ndarray, batch_size: int = 8192) -> np.ndarray:
+    """Signed distance: negative inside, positive outside.
+
+    Avoids mesh.contains() (ray-casting, extremely memory-intensive) by deriving
+    the sign from the dot product of (query − closest_surface) with the face
+    normal at the closest triangle.  This is O(N) RAM instead of O(N × triangles).
+
+    ProximityQuery is built once per call so the BVH is not rebuilt per batch.
+    """
     import trimesh.proximity
-    _, distances, _ = trimesh.proximity.closest_point(mesh, points)
-    inside = mesh.contains(points)
-    return np.where(inside, -distances, distances).astype(np.float32)
+    points = np.asarray(points, dtype=np.float64)
+    prox = trimesh.proximity.ProximityQuery(mesh)
+    face_normals = np.asarray(mesh.face_normals, dtype=np.float64)
+
+    sdf = np.empty(len(points), dtype=np.float32)
+    for i in range(0, len(points), batch_size):
+        batch = points[i : i + batch_size]
+        closest, distances, tri_ids = prox.on_surface(batch)
+        # Sign: positive outside (dot > 0), negative inside (dot < 0)
+        direction = batch - closest
+        dot = np.einsum("ij,ij->i", direction, face_normals[tri_ids])
+        sign = np.where(dot >= 0, 1.0, -1.0)
+        sdf[i : i + batch_size] = (sign * distances).astype(np.float32)
+
+    del prox  # release BVH memory explicitly
+    return sdf
 
 
 def sample_query_points(
@@ -453,27 +484,29 @@ def sample_query_points(
     near_surface_fraction: float = 0.5,
     near_surface_std: float | None = None,
 ) -> np.ndarray:
-    """Sample query points directly in normalized mesh coordinates."""
+    """Sample query points in the full TripoSR scene volume [-radius, radius]³.
+
+    With near_surface_fraction=0 (default for training), all points are drawn
+    uniformly from the same [-radius, radius]³ cube that marching-cubes evaluates
+    during inference — eliminating the training/inference distribution mismatch.
+    """
     if near_surface_std is None:
         near_surface_std = float(radius * 0.04)
-    n_near = int(n_points * near_surface_fraction)
+    n_near    = int(n_points * near_surface_fraction)
     n_uniform = n_points - n_near
-    lo, hi = mesh.bounds[0], mesh.bounds[1]
-    uniform = np.stack(
-        [np.random.uniform(lo[i], hi[i], n_uniform) for i in range(3)],
-        axis=1,
-    )
-    if len(mesh.vertices) > 0 and n_near > 0:
-        idx = np.random.choice(len(mesh.vertices), n_near, replace=True)
+
+    # Uniform samples span the full triplane query volume, not just mesh bounds.
+    uniform = np.random.uniform(-radius, radius, (n_uniform, 3)).astype(np.float32)
+
+    if n_near > 0 and len(mesh.vertices) > 0:
+        idx   = np.random.choice(len(mesh.vertices), n_near, replace=True)
         verts = np.asarray(mesh.vertices[idx], dtype=np.float64)
         noise = np.random.normal(0.0, near_surface_std, (n_near, 3))
-        near = verts + noise
+        near  = (verts + noise).astype(np.float32)
     else:
-        near = np.stack(
-            [np.random.uniform(lo[i], hi[i], n_near) for i in range(3)],
-            axis=1,
-        )
-    pts = np.concatenate([uniform, near], axis=0).astype(np.float32)
+        near = np.zeros((0, 3), dtype=np.float32)
+
+    pts = np.concatenate([uniform, near], axis=0) if n_near > 0 else uniform
     return np.clip(pts, -radius, radius)
 
 
@@ -549,13 +582,15 @@ def render_mesh_to_image(
 
 # ─── Objaverse helpers ────────────────────────────────────────────────────────
 
-def get_objaverse_uid_pool(seed: int = 42) -> list[str]:
+def get_objaverse_uid_pool(seed: int = 42, quiet: bool = False) -> list[str]:
     import objaverse
-    print("[objaverse] Loading UID list...")
+    if not quiet:
+        print("[objaverse] Loading UID list...")
     all_uids = list(objaverse.load_uids())
     rng = random.Random(seed)
     rng.shuffle(all_uids)
-    print(f"[objaverse] {len(all_uids)} UIDs available")
+    if not quiet:
+        print(f"[objaverse] {len(all_uids)} UIDs available")
     return all_uids
 
 
@@ -583,148 +618,46 @@ def download_mesh(uid: str, cache_dir: str) -> str:
 
 # ─── PRECOMPUTE phase ─────────────────────────────────────────────────────────
 
-def _decode_saved_triplane_to_mesh(
-    sample_dir: Path,
-    model,
-    device: str,
-    mc_resolution: int,
-) -> Path | None:
-    """Decode ``triplane.pt`` with the original TripoSR decoder + marching cubes.
-
-    This validates the exact tensor saved during precompute. Returns the path to
-    ``triposr_mesh.obj`` on success, otherwise ``None``.
-    """
-    target = sample_dir / "triposr_mesh.obj"
-    if target.exists() and target.stat().st_size > 0:
-        return target
-    triplane_path = sample_dir / "triplane.pt"
-    if not triplane_path.exists():
-        print(f"[viewer] Cannot decode triplane: {triplane_path} missing.")
-        return None
-    # try:
-    triplane = torch.load(triplane_path, map_location="cpu")
-    # triplane = torch.load("/home/markiv/TripoSR/render_output/0/triplane.pt", map_location="cpu", weights_only=False)
-    if not isinstance(triplane, torch.Tensor):
-        raise TypeError(f"Expected tensor in {triplane_path}, got {type(triplane)}")
-    scene_codes = triplane.float()
-    if scene_codes.ndim == 4:
-        scene_codes = scene_codes.unsqueeze(0)
-    if scene_codes.ndim != 5:
-        raise ValueError(f"Unexpected triplane shape {tuple(scene_codes.shape)}")
-    scene_codes = scene_codes.to(device)
-
-    # Try the default threshold first, then a few fallback thresholds for
-    # views whose density field is too sparse at 25.0.
-    thresholds = [25.0, 15.0, 8.0, 2.0, 0.0, -2.0]
-    last_err = None
-    # print(scene_codes)
-    for thr in thresholds:
-        try:
-            last_err = None
-            # with torch.no_grad():
-            meshes = model.extract_mesh(
-                scene_codes,
-                has_vertex_color=False,
-                resolution=mc_resolution,
-                threshold=float(thr),
-            )
-            if not meshes:
-                continue
-            mesh = meshes[0]
-            if len(mesh.faces) == 0:
-                continue
-            mesh.export(str(target))
-            return target
-        except Exception as e:
-            last_err = e
-            continue
-    if last_err is not None:
-        print(f"[viewer] Triplane decode failed for {sample_dir.name}: {last_err}")
-    else:
-        print(f"[viewer] Triplane decode produced no triangles for {sample_dir.name}.")
-    return None
-    # except Exception as e:
-    #     print(f"[viewer] Failed reading/decoding triplane for {sample_dir.name}: {e}")
-    #     return None
-
-
-def _launch_precompute_viewer(samples_dir: Path, model, device: str, mc_resolution: int) -> None:
-    """Open a Gradio viewer comparing the source mesh with the TripoSR MLP output.
-
-    Picks the lexicographically-first completed sample and decodes its saved
-    ``triplane.pt`` through the original TripoSR decoder.
-    """
-    try:
-        from view_mesh import launch_multi_viewer
-    except ImportError as e:
-        print(f"[viewer] Skipping: could not import view_mesh.launch_multi_viewer ({e}).")
-        return
-
-    if not samples_dir.exists():
-        print(f"[viewer] Skipping: {samples_dir} does not exist.")
-        return
-
-    candidates = sorted(
-        sd for sd in samples_dir.iterdir()
-        if sd.is_dir()
-        and not sd.name.startswith("_tmp")
-        and (sd / "source_mesh.obj").exists()
-        and (sd / "input_view.png").exists()
-        and (sd / "triplane.pt").exists()
-    )
-    if not candidates:
-        print("[viewer] Skipping: no completed samples with source_mesh.obj + input_view.png + triplane.pt found.")
-        return
-
-    print(f"[viewer] Decoding {len(candidates)} triplane(s) for sanity-check viewer ...")
-    viewer_samples: list[dict] = []
-    for sample_dir in candidates:
-        triposr_mesh_path = _decode_saved_triplane_to_mesh(sample_dir, model, device, mc_resolution)
-        if triposr_mesh_path is None:
-            print(f"[viewer] Skipping {sample_dir.name}: triplane decode failed.")
-            continue
-        render_image = sample_dir / "input_view.png"
-        extrinsics = sample_dir / "camera_extrinsics.json"
-        viewer_samples.append({
-            "name": sample_dir.name,
-            "mesh_path": str(triposr_mesh_path),
-            "source_mesh_path": str(sample_dir / "source_mesh.obj"),
-            "render_image_path": str(render_image) if render_image.exists() else None,
-            "output_dir": str(sample_dir),
-            "camera_extrinsics_path": str(extrinsics) if extrinsics.exists() else None,
-            # source_mesh.obj was already normalized during precompute.
-            "normalize_source_to_unit_cube": False,
-        })
-
-    if not viewer_samples:
-        print("[viewer] Skipping: no samples decoded successfully.")
-        return
-
-    print(f"[viewer] Launching multi-sample viewer with {len(viewer_samples)} sample(s).")
-    launch_multi_viewer(viewer_samples)
-
-
 def run_precompute(args: argparse.Namespace) -> None:
+    # Multi-GPU shard: each rank processes a disjoint subset of UIDs.
+    # No dist.init_process_group needed — ranks write independently to shared disk.
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    rank       = int(os.environ.get("RANK", 0))
+    is_main    = (rank == 0)
+
     dataset_dir = Path(args.dataset_dir)
     samples_dir = dataset_dir / "samples"
     if samples_dir.exists() and any(samples_dir.iterdir()):
         existing = sum(1 for _ in samples_dir.iterdir() if not _.name.startswith("_tmp"))
-        answer = input(
-            f"Found {existing} existing samples in {samples_dir}.\n"
-            f"Delete all and restart? [y/N] "
-        ).strip().lower()
-        if answer in ("y", "yes"):
-            shutil.rmtree(samples_dir)
-            print("Deleted existing samples.")
+        if world_size > 1:
+            if is_main:
+                print(f"Found {existing} existing samples; keeping existing work "
+                      f"(delete manually to restart from scratch).")
         else:
-            print("Keeping existing samples (will skip already-done azimuths).")
+            answer = input(
+                f"Found {existing} existing samples in {samples_dir}.\n"
+                f"Delete all and restart? [y/N] "
+            ).strip().lower()
+            if answer in ("y", "yes"):
+                shutil.rmtree(samples_dir)
+                print("Deleted existing samples.")
+            else:
+                print("Keeping existing samples (will skip already-done views).")
 
     from tsr.system import TSR
 
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    print(f"Precompute on {device}")
+    if not args.verbose:
+        import warnings
+        warnings.filterwarnings("ignore")
 
-    print("Loading TripoSR...")
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    if is_main:
+        suffix = f" across {world_size} GPUs" if world_size > 1 else ""
+        print(f"Precompute on {device}{suffix}")
+
+    if is_main:
+        print("Loading TripoSR...")
     model = TSR.from_pretrained(args.model, config_name="config.yaml", weight_name="model.ckpt")
     model.renderer.set_chunk_size(8192)
     model.to(device).eval()
@@ -740,37 +673,51 @@ def run_precompute(args: argparse.Namespace) -> None:
     cache_dir = str(dataset_dir / "mesh_cache")
     samples_dir.mkdir(parents=True, exist_ok=True)
 
-    metadata = {
-        "radius": radius,
-        "feature_reduction": feature_reduction,
-        "feat_dim": feat_dim,
-        "n_points": args.n_points,
-    }
-    with open(dataset_dir / "metadata.json", "w") as f:
-        json.dump(metadata, f, indent=2)
-    print(f"Metadata -> {dataset_dir / 'metadata.json'}")
+    # Only rank 0 writes metadata (all ranks would write identical content).
+    if is_main:
+        metadata = {
+            "radius": radius,
+            "feature_reduction": feature_reduction,
+            "feat_dim": feat_dim,
+            "n_points": args.n_points,
+            "near_surface_fraction": args.near_surface_fraction,
+            "elevations": args.elevations,
+        }
+        with open(dataset_dir / "metadata.json", "w") as f:
+            json.dump(metadata, f, indent=2)
+        print(f"Metadata -> {dataset_dir / 'metadata.json'}")
 
-    uids = get_objaverse_uid_pool()
-    target_objects = args.n_objects
-    azimuths = np.linspace(0, 360, args.azimuths_per_mesh, endpoint=False)
+    uids = get_objaverse_uid_pool(quiet=not is_main)
+    # Strided shard: rank r gets uids[r], uids[r+W], uids[r+2W], ...
+    # Disjoint across ranks, same fixed-seed shuffle on all ranks.
+    uids_for_rank  = uids[rank::world_size]
+    target_objects = (args.n_objects + world_size - 1) // world_size  # ceil(N/W) per rank
 
-    pbar = tqdm(total=target_objects, unit="obj", dynamic_ncols=True)
+    azimuths   = np.linspace(0, 360, args.azimuths_per_mesh, endpoint=False)
+    elevations = list(args.elevations)
+    view_pairs = list(itertools.product(azimuths, elevations))  # (az, el) × n_views
+    n_views    = len(view_pairs)
+
+    if is_main:
+        print(f"View pairs ({n_views} per object): "
+              f"{args.azimuths_per_mesh} azimuths × {len(elevations)} elevations")
+        if world_size > 1:
+            print(f"Distributed precompute: {world_size} ranks, "
+                  f"~{target_objects} objects each (~{target_objects * world_size} total)")
+
+    pbar = tqdm(total=target_objects, unit="obj", dynamic_ncols=True,
+                desc=f"rank{rank}" if world_size > 1 else "precompute",
+                position=rank, leave=True)
     obj_saved = obj_skipped = 0
 
-    for uid in uids:
+    for uid in uids_for_rank:
         if obj_saved >= target_objects:
             break
 
         _done = [
-            all((samples_dir / f"{uid}_az{int(az):03d}" / fn).exists()
-                for fn in (
-                    "triplane.pt",
-                    "query_pts.pt",
-                    "sdf_gt.pt",
-                    "camera_extrinsics.json",
-                    "source_mesh.obj",
-                ))
-            for az in azimuths
+            all((samples_dir / f"{uid}_az{int(az):03d}_el{int(el):03d}" / fn).exists()
+                for fn in ("triplane.pt", "query_pts.pt", "sdf_gt.pt", "camera_extrinsics.json"))
+            for az, el in view_pairs
         ]
         if all(_done):
             obj_saved += 1
@@ -783,13 +730,23 @@ def run_precompute(args: argparse.Namespace) -> None:
             if args.max_mesh_mb > 0:
                 size_mb = os.path.getsize(mesh_path) / (1024 * 1024)
                 if size_mb > args.max_mesh_mb:
-                    tqdm.write(f"[skip mesh] {uid}: {size_mb:.1f} MB > limit {args.max_mesh_mb} MB")
+                    if args.verbose:
+                        tqdm.write(f"[skip mesh] {uid}: {size_mb:.1f} MB > limit {args.max_mesh_mb} MB")
                     obj_skipped += 1
                     pbar.set_postfix(objects=obj_saved, skipped=obj_skipped)
                     continue
             raw = _load_trimesh(mesh_path)
             mesh, _, _ = _normalize_mesh_copy(raw, radius)
+            del raw  # raw is no longer needed; release before heavy SDF computation
             if not mesh.is_watertight:
+                del mesh
+                obj_skipped += 1
+                pbar.set_postfix(objects=obj_saved, skipped=obj_skipped)
+                continue
+            if args.max_triangles > 0 and len(mesh.faces) > args.max_triangles:
+                if args.verbose:
+                    tqdm.write(f"[skip mesh] {uid}: {len(mesh.faces):,} faces > limit {args.max_triangles:,}")
+                del mesh
                 obj_skipped += 1
                 pbar.set_postfix(objects=obj_saved, skipped=obj_skipped)
                 continue
@@ -798,10 +755,17 @@ def run_precompute(args: argparse.Namespace) -> None:
             pbar.set_postfix(objects=obj_saved, skipped=obj_skipped)
             if args.verbose:
                 tqdm.write(f"[skip mesh] {uid}: {e}")
-            continue
+            continue  # silent skip by default
 
-        for az, already_done in zip(azimuths, _done):
-            sample_id = f"{uid}_az{int(az):03d}"
+        # Precompute SDF once per object (query points are shared across views)
+        query_pts_np = sample_query_points(
+            mesh, args.n_points, radius,
+            near_surface_fraction=args.near_surface_fraction,
+        )
+        sdf_gt_np = compute_sdf(mesh, query_pts_np)
+
+        for (az, el), already_done in zip(view_pairs, _done):
+            sample_id  = f"{uid}_az{int(az):03d}_el{int(el):03d}"
             sample_dir = samples_dir / sample_id
 
             if already_done:
@@ -811,51 +775,37 @@ def run_precompute(args: argparse.Namespace) -> None:
                 tmp_dir = sample_dir.parent / f"_tmp_{sample_id}"
                 tmp_dir.mkdir(parents=True, exist_ok=True)
 
-                # 1. Render the normalized source mesh to an image (saved to disk
-                #    first so that we re-load it the same way ``run.py`` does).
+                # 1. Render to a temporary PNG and re-load as RGB array so the
+                #    bytes are identical to what run.py / render_to_triposr.py produce.
+                tmp_png = tmp_dir / "_render_tmp.png"
                 pil_image = render_mesh_to_image(
                     mesh,
-                    elevation=args.elevation,
+                    elevation=float(el),
                     fov=args.fov,
                     size=args.image_size,
                     azimuth=float(az),
                     extrinsics_json_path=tmp_dir / "camera_extrinsics.json",
                 )
-                input_png_path = tmp_dir / "input_view.png"
-                pil_image.save(input_png_path)
+                pil_image.save(tmp_png)
+                image_np = np.array(Image.open(tmp_png).convert("RGB"))
+                tmp_png.unlink()  # not stored — only needed for TripoSR input
+                del pil_image
 
-                # 2. Re-load the PNG as an RGB NumPy array -- byte-identical to
-                #    ``run.py --no-remove-bg`` / ``render_to_triposr.py`` so that
-                #    any downstream failure cannot be attributed to a different
-                #    image representation.
-                image_np = np.array(Image.open(input_png_path).convert("RGB"))
-
-                # 3. Run TripoSR to get the triplane (scene_codes).
+                # 2. Run TripoSR to get the triplane (scene_codes).
                 with torch.no_grad():
                     scene_codes = model([image_np], device=device)
                 triplane = scene_codes[0].half().cpu()
+                del image_np, scene_codes
 
-                # 4. Sample query points in the normalized mesh frame and
-                #    compute signed distances against the source mesh.
-                query_pts_np = sample_query_points(
-                    mesh, args.n_points, radius
-                )
-                sdf_gt_np = compute_sdf(mesh, query_pts_np)
-
-                # 5. Persist the core tensors used by training. The decoded
-                #    sanity-check mesh (``triposr_mesh.obj``) is produced later,
-                #    on-demand, via ``run.py`` subprocess -- the exact same path
-                #    ``render_to_triposr.py`` uses.
+                # 3. Persist core training tensors only (no source_mesh.obj, no input_view.png).
                 torch.save(triplane, tmp_dir / "triplane.pt")
                 torch.save(torch.from_numpy(query_pts_np), tmp_dir / "query_pts.pt")
                 torch.save(torch.from_numpy(sdf_gt_np), tmp_dir / "sdf_gt.pt")
-                mesh.export(str(tmp_dir / "source_mesh.obj"))
 
                 tmp_dir.rename(sample_dir)
-
                 pbar.set_postfix(objects=obj_saved, skipped=obj_skipped, uid=uid[:8])
 
-                del pil_image, image_np, scene_codes, triplane
+                del triplane
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 gc.collect()
@@ -867,25 +817,22 @@ def run_precompute(args: argparse.Namespace) -> None:
                         f"[skip sample] {sample_id}: {e}\n"
                         + traceback.format_exc()
                     )
-                else:
-                    tqdm.write(f"[skip sample] {sample_id}: {e}")
 
         obj_saved += 1
         pbar.update(1)
         pbar.set_postfix(objects=obj_saved, skipped=obj_skipped)
 
-        del mesh, raw
+        del mesh, query_pts_np, sdf_gt_np
         gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     pbar.close()
-    total_samples = obj_saved * args.azimuths_per_mesh
-    print(f"\nPrecompute done — {obj_saved} objects ({total_samples} samples), "
-          f"{obj_skipped} skipped -> {dataset_dir}")
+    if is_main:
+        total_samples = obj_saved * n_views
+        print(f"\nPrecompute done — {obj_saved} objects ({total_samples} samples), "
+              f"{obj_skipped} skipped -> {dataset_dir}")
 
-    if getattr(args, "launch_viewer_after_precompute", False):
-        _launch_precompute_viewer(samples_dir, model, device, args.mc_resolution)
-
-    # Free the TripoSR model after optional sanity-check decoding/viewing.
     del model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -924,57 +871,88 @@ class SDFPointDataset(Dataset):
         radius = self.meta["radius"]
         feature_reduction = self.meta["feature_reduction"]
 
-        ordered_dirs: list[Path] = []
-        seen_dir: set[str] = set()
-        for sample_path in all_samples:
-            d = sample_path.parent
-            key = str(d)
-            if key not in seen_dir:
-                seen_dir.add(key)
-                ordered_dirs.append(d)
-        path_to_si = {pp: i for i, pp in enumerate(ordered_dirs)}
-        R_rows = [load_R_world_from_recon_json_strict(d) for d in ordered_dirs]
-        self.R_stack = torch.from_numpy(np.stack(R_rows, axis=0)).float()
+        # ── Flat cache (memory-mapped) ─────────────────────────────────────────
+        # Built once from the precomputed samples; on all subsequent runs every
+        # process mmaps the same files so only the pages touched per batch are
+        # paged in, and the OS shares physical pages across DDP ranks.
+        cache_dir  = root / "_flat_cache"
+        cache_meta = cache_dir / "meta.json"
+        sample_names = [p.parent.name for p in all_samples]
 
-        pts_list, sdf_list, feats_list, sid_list = [], [], [], []
-        print(f"Loading {len(all_samples)} samples and computing triplane features...")
-        for sample_path in all_samples:
-            p = sample_path.parent
-            si = path_to_si[p]
-            triplane = torch.load(p / "triplane.pt", map_location="cpu", weights_only=False).float()
-            pts = torch.load(p / "query_pts.pt", map_location="cpu", weights_only=False)
-            sdf = torch.load(p / "sdf_gt.pt", map_location="cpu", weights_only=False)
-            if (pts.abs() > float(radius) + 1e-4).any():
-                raise RuntimeError(
-                    f"query_pts outside [-radius, radius] in {p} (radius={radius}). "
-                    "Re-run precompute."
-                )
-            pts = pts.clamp(-float(radius), float(radius))
-            R = self.R_stack[si]
-            with torch.no_grad():
-                pts_trip = pts @ R.T
-                feats = query_triplane_features(pts_trip, triplane, radius, feature_reduction)
-            pts_list.append(pts)
-            sdf_list.append(sdf)
-            feats_list.append(feats)
-            sid_list.append(torch.full((pts.shape[0],), si, dtype=torch.long))
+        cache_valid = False
+        if cache_dir.exists() and cache_meta.exists():
+            try:
+                with open(cache_meta) as f:
+                    cache_valid = json.load(f).get("sample_names") == sample_names
+            except Exception:
+                pass
 
-        self.all_pts = torch.cat(pts_list, dim=0)
-        self.all_sdf = torch.cat(sdf_list, dim=0)
-        self.all_feats = torch.cat(feats_list, dim=0)
-        self.point_sample_id = torch.cat(sid_list, dim=0)
-        self.sample_dirs = [p.parent for p in all_samples]
-        print(f"Dataset ready: {self.all_pts.shape[0]} points, feats shape {self.all_feats.shape}")
-        print(
-            "SDF targets used as-is (mesh already normalized to unit cube in precompute; "
-            f"|sdf| in [0, {self.all_sdf.abs().max().item():.4f}])"
-        )
+        if not cache_valid:
+            print(f"Building flat cache for {len(all_samples)} samples "
+                  f"(one-time cost; mmap'd on all future runs)...")
+            cache_dir.mkdir(exist_ok=True)
+
+            ordered_dirs: list[Path] = []
+            seen_dir: set[str] = set()
+            for sp in all_samples:
+                d = sp.parent
+                if str(d) not in seen_dir:
+                    seen_dir.add(str(d))
+                    ordered_dirs.append(d)
+            path_to_si = {pp: i for i, pp in enumerate(ordered_dirs)}
+            R_rows = [load_R_world_from_recon_json_strict(d) for d in ordered_dirs]
+            R_stack = torch.from_numpy(np.stack(R_rows, axis=0)).float()
+
+            pts_list, sdf_list, feats_list, sid_list = [], [], [], []
+            for sp in tqdm(all_samples, desc="building cache", unit="sample", leave=False):
+                p = sp.parent
+                si = path_to_si[p]
+                triplane = torch.load(p / "triplane.pt", map_location="cpu",
+                                      weights_only=False).float()
+                pts = torch.load(p / "query_pts.pt", map_location="cpu",
+                                 weights_only=False)
+                sdf = torch.load(p / "sdf_gt.pt",    map_location="cpu",
+                                 weights_only=False)
+                pts = pts.clamp(-float(radius), float(radius))
+                with torch.no_grad():
+                    pts_trip = pts @ R_stack[si].T
+                    feats = query_triplane_features(pts_trip, triplane, radius,
+                                                   feature_reduction)
+                pts_list.append(pts.numpy())
+                sdf_list.append(sdf.numpy())
+                feats_list.append(feats.numpy())
+                sid_list.append(np.full(pts.shape[0], si, dtype=np.int64))
+                del triplane, pts, sdf, feats, pts_trip
+
+            np.save(cache_dir / "feats.npy",   np.concatenate(feats_list, axis=0))
+            np.save(cache_dir / "pts.npy",     np.concatenate(pts_list,   axis=0))
+            np.save(cache_dir / "sdf.npy",     np.concatenate(sdf_list,   axis=0))
+            np.save(cache_dir / "sid.npy",     np.concatenate(sid_list,   axis=0))
+            np.save(cache_dir / "R_stack.npy", R_stack.numpy())
+            with open(cache_meta, "w") as f:
+                json.dump({"sample_names": sample_names}, f)
+            del pts_list, sdf_list, feats_list, sid_list
+            gc.collect()
+            print(f"Cache built → {cache_dir}")
+
+        # mmap: the OS pages in only what each batch touches, shared across ranks
+        self.all_feats       = np.load(cache_dir / "feats.npy", mmap_mode="r")
+        self.all_pts         = np.load(cache_dir / "pts.npy",   mmap_mode="r")
+        self.all_sdf         = np.load(cache_dir / "sdf.npy",   mmap_mode="r")
+        self.point_sample_id = np.load(cache_dir / "sid.npy",   mmap_mode="r")
+        self.R_stack         = torch.from_numpy(
+                                   np.load(cache_dir / "R_stack.npy"))
+        self.sample_dirs     = [sp.parent for sp in all_samples]
+        print(f"Dataset: {self.all_pts.shape[0]:,} points  "
+              f"(mmap from {cache_dir.name}/)")
 
     def __len__(self) -> int:
         return self.all_pts.shape[0]
 
     def __getitem__(self, idx: int):
-        return self.all_feats[idx], self.all_pts[idx], self.all_sdf[idx], self.point_sample_id[idx]
+        # numpy memmap indexing returns ndarray; DataLoader collate converts to tensor
+        return (self.all_feats[idx], self.all_pts[idx],
+                self.all_sdf[idx],   self.point_sample_id[idx])
 
 
 # ─── Visualization helpers ────────────────────────────────────────────────────
@@ -1113,10 +1091,8 @@ def reconstruct_mesh_nerf_decoder(
 ):
     """Run TripoSR's original NeRF decoder on a grid and extract a mesh via marching cubes.
 
-    When R_world_from_trip is provided, applies verts @ R.T to rotate from the
-    camera-centric TripoSR frame back to GT mesh orientation (inverse of the
-    R that maps GT frame → camera-centric frame, i.e. the transform training uses
-    in reverse).
+    When R_world_from_trip is provided, applies verts @ R to rotate the marching-cubes
+    output from TripoSR space into world space (same convention as reconstruct_mesh_from_triplane).
     """
     import trimesh as tr
 
@@ -1151,73 +1127,6 @@ def reconstruct_mesh_nerf_decoder(
         R = np.asarray(R_world_from_trip, dtype=np.float64)
         verts = verts @ R
     return tr.Trimesh(vertices=verts, faces=faces, vertex_normals=normals)
-
-
-def compute_nerf_vs_sdf_stats(
-    triposr_decoder: nn.Module,
-    triplane: torch.Tensor,
-    query_pts: torch.Tensor,
-    sdf_gt: torch.Tensor,
-    R_world_from_trip: np.ndarray,
-    radius: float,
-    feature_reduction: str,
-    density_activation: str,
-    density_bias: float,
-    threshold: float = 25.0,
-    batch_size: int = 4096,
-    device: torch.device = None,
-) -> dict:
-    """Compare NeRF decoder density to GT SDF at precomputed query points.
-
-    query_pts and sdf_gt are in mesh/world frame (as saved by precompute).
-    Points are rotated into TripoSR frame before triplane lookup.
-
-    The key diagnostic: if the coordinate frame is correct, NeRF density should
-    be high (> threshold) exactly where GT SDF is negative (inside the mesh).
-    occupancy_accuracy measures this directly.  The per-bin density table shows
-    how density varies with GT distance from surface.
-    """
-    if device is None:
-        device = next(triposr_decoder.parameters()).device
-
-    R = torch.from_numpy(R_world_from_trip).float()
-    pts_trip = (query_pts.float() @ R.T)             # mesh frame → TripoSR frame
-
-    triplane_dev = triplane.to(device)
-    act_fn = get_activation(density_activation)
-    all_density: list[torch.Tensor] = []
-
-    with torch.no_grad():
-        for i in range(0, len(pts_trip), batch_size):
-            batch = pts_trip[i : i + batch_size].to(device)
-            feats = query_triplane_features(batch, triplane_dev, radius, feature_reduction)
-            raw = triposr_decoder(feats)["density"].squeeze(-1)
-            all_density.append(act_fn(raw + density_bias).cpu())
-
-    density = torch.cat(all_density).numpy()
-    sdf = sdf_gt.numpy()
-
-    # Occupancy accuracy: (density > threshold) should match (sdf < 0)
-    pred_inside = density > threshold
-    gt_inside   = sdf < 0
-    occupancy_accuracy = float((pred_inside == gt_inside).mean())
-
-    # MSE per SDF-distance bin — shows where the density mismatch is worst
-    bin_edges  = [-np.inf, -0.1, -0.02, 0.0, 0.02, 0.1, np.inf]
-    bin_labels = ["< -0.1", "-0.1→-0.02", "-0.02→0", "0→0.02", "0.02→0.1", "> 0.1"]
-    bin_mse: dict[str, float] = {}
-    for lo, hi, lbl in zip(bin_edges[:-1], bin_edges[1:], bin_labels):
-        mask = (sdf > lo) & (sdf <= hi)
-        if mask.any():
-            bin_mse[lbl] = float(((pred_inside[mask].astype(float) - gt_inside[mask].astype(float)) ** 2).mean())
-
-    return {
-        "occupancy_accuracy": occupancy_accuracy,
-        "density_mean":         float(density.mean()),
-        "density_max":          float(density.max()),
-        "density_surface_mean": float(density[np.abs(sdf) < 0.02].mean()) if (np.abs(sdf) < 0.02).any() else float("nan"),
-        "bin_occupancy_mse":    bin_mse,
-    }
 
 
 def create_mesh_comparison_visualization(
@@ -1325,9 +1234,6 @@ def visualize_reconstructions(
 ) -> None:
     sdf_mlp.eval()
 
-    # Accumulate gradient stats across all vis samples for a single wandb log.
-    all_grad_stats: list[dict] = []
-
     for label, sample_dirs in (("seen", seen_dirs), ("unseen", unseen_dirs)):
         for sample_dir in sample_dirs:
             uid = sample_dir.name.split("_az")[0]
@@ -1359,11 +1265,15 @@ def visualize_reconstructions(
                     continue
                 gt_mesh = load_and_normalize_mesh(str(mesh_files[0]), radius)
 
-                az_str = sample_dir.name.split("_az")[-1]
-                az_deg = float(az_str) if az_str.isdigit() else 0.0
+                # Parse azimuth and elevation from sample name: {uid}_az{az:03d}_el{el:03d}
+                suffix   = sample_dir.name.split("_az")[-1]  # e.g. "045_el015"
+                az_part  = suffix.split("_el")[0]
+                el_part  = suffix.split("_el")[1] if "_el" in suffix else None
+                az_deg   = float(az_part) if az_part.isdigit() else 0.0
+                el_deg   = float(el_part) if (el_part is not None and el_part.isdigit()) else elevation
                 input_pil = render_mesh_to_image(
                     gt_mesh,
-                    elevation=elevation,
+                    elevation=el_deg,
                     fov=fov,
                     size=image_size,
                     azimuth=az_deg,
@@ -1371,7 +1281,7 @@ def visualize_reconstructions(
                 )
                 input_image = np.array(input_pil)
 
-                # ── TripoSR decoder sanity checks ─────────────────────────────
+                # ── Optional NeRF decoder sanity mesh (USE_NERF_VIS=True only) ─
                 nerf_mesh = None
                 if triposr_decoder is not None:
                     try:
@@ -1391,37 +1301,6 @@ def visualize_reconstructions(
                             tqdm.write(f"[vis] NeRF decoder marching cubes failed for {uid}")
                     except Exception as e:
                         tqdm.write(f"[vis] NeRF decoder mesh failed for {uid}: {e}")
-
-                    try:
-                        query_pts_disk = torch.load(
-                            sample_dir / "query_pts.pt", map_location="cpu", weights_only=False
-                        )
-                        sdf_gt_disk = torch.load(
-                            sample_dir / "sdf_gt.pt", map_location="cpu", weights_only=False
-                        )
-                        nerf_stats = compute_nerf_vs_sdf_stats(
-                            triposr_decoder,
-                            triplane,
-                            query_pts_disk,
-                            sdf_gt_disk,
-                            R_np,
-                            radius,
-                            feature_reduction,
-                            density_activation,
-                            density_bias,
-                            threshold=nerf_threshold,
-                            device=device,
-                        )
-                        nerf_stats["_uid"] = uid
-                        nerf_stats["_label"] = label
-                        all_grad_stats.append(nerf_stats)
-                        tqdm.write(
-                            f"[vis] {uid[:12]} occ_acc={nerf_stats['occupancy_accuracy']:.3f} "
-                            f"density_surface={nerf_stats['density_surface_mean']:.2f} "
-                            f"density_max={nerf_stats['density_max']:.1f}"
-                        )
-                    except Exception as e:
-                        tqdm.write(f"[vis] nerf vs sdf stats failed for {uid}: {e}")
 
                 save_path = output_dir / label / f"{uid}_epoch{epoch:04d}.png"
                 create_mesh_comparison_visualization(
@@ -1449,34 +1328,29 @@ def visualize_reconstructions(
             except Exception as e:
                 tqdm.write(f"[vis] failed for {uid}: {e}")
 
-    # ── Log aggregated NeRF-vs-SDF stats to wandb ────────────────────────────
-    if wandb_enabled and all_grad_stats and triposr_decoder is not None:
-        try:
-            agg = {
-                "nerf_sanity/occupancy_accuracy":   np.mean([s["occupancy_accuracy"]   for s in all_grad_stats]),
-                "nerf_sanity/density_surface_mean": np.nanmean([s["density_surface_mean"] for s in all_grad_stats]),
-                "nerf_sanity/density_max_mean":     np.mean([s["density_max"]           for s in all_grad_stats]),
-                "nerf_sanity/epoch": epoch,
-            }
-            # Per-bin occupancy MSE: average across samples for each bin label
-            all_bins: dict[str, list[float]] = {}
-            for s in all_grad_stats:
-                for lbl, val in s["bin_occupancy_mse"].items():
-                    all_bins.setdefault(lbl, []).append(val)
-            for lbl, vals in all_bins.items():
-                agg[f"nerf_sanity/bin_mse/{lbl}"] = float(np.mean(vals))
-            wandb.log(agg)
-        except Exception as e:
-            tqdm.write(f"[vis] wandb nerf stats log failed: {e}")
-
     sdf_mlp.train()
 
 
 # ─── TRAIN phase ──────────────────────────────────────────────────────────────
 
 def run_train(args: argparse.Namespace) -> None:
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print(f"Training on {device}")
+    # ── DDP setup — works with torchrun --nproc_per_node=N; falls back to 1 GPU ─
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    rank       = int(os.environ.get("RANK", 0))
+    is_ddp  = world_size > 1
+    is_main = (rank == 0)
+
+    if is_ddp:
+        dist.init_process_group(backend="nccl")
+        device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(device)
+    else:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    if is_main:
+        suffix = f" — DDP across {world_size} GPUs (effective batch {args.batch_size * world_size})" if is_ddp else ""
+        print(f"Training on {device}{suffix}")
 
     # ── wandb ─────────────────────────────────────────────────────────────────
     wandb_enabled = False
@@ -1486,6 +1360,24 @@ def run_train(args: argparse.Namespace) -> None:
     cache_dir = str(dataset_dir / "mesh_cache")
     all_sample_paths = sorted((dataset_dir / "samples").glob("*/triplane.pt"))
     all_uids = sorted({p.parent.name.split("_az")[0] for p in all_sample_paths})
+
+    # Cap to n_objects and azimuths_per_mesh (mirrors precompute behaviour)
+    if len(all_uids) > args.n_objects:
+        all_uids = all_uids[:args.n_objects]
+    uid_set = set(all_uids)
+    uid_az_seen: dict[str, set[str]] = {}
+    allowed_names: set[str] = set()
+    for p in all_sample_paths:
+        name = p.parent.name
+        uid = name.split("_az")[0]
+        if uid not in uid_set:
+            continue
+        az = name.split("_az")[1].split("_el")[0]
+        uid_az_seen.setdefault(uid, set())
+        if len(uid_az_seen[uid]) < args.azimuths_per_mesh or az in uid_az_seen[uid]:
+            uid_az_seen[uid].add(az)
+            allowed_names.add(name)
+    all_sample_paths = [p for p in all_sample_paths if p.parent.name in allowed_names]
 
     rng_split = random.Random(42)
     shuffled_uids = list(all_uids)
@@ -1508,38 +1400,55 @@ def run_train(args: argparse.Namespace) -> None:
     else:
         train_view_names = set(train_sample_names)
 
+    # Rank 0 builds the flat cache; other ranks wait then load via mmap.
+    if is_ddp and not is_main:
+        dist.barrier()
     dataset = SDFPointDataset(args.dataset_dir, sample_whitelist=train_view_names)
+    if is_ddp and is_main:
+        dist.barrier()
     meta = dataset.meta
     radius: float = meta["radius"]
     feature_reduction: str = meta["feature_reduction"]
     feat_dim: int = meta["feat_dim"]
     R_stack_device = dataset.R_stack.to(device)
 
-    # ── Load frozen TripoSR decoder for sanity-check visualizations ───────────
+    # ── Optionally load frozen TripoSR decoder for NeRF sanity-check mesh ────
+    # Only rank 0 runs visualization, so other ranks skip the decoder entirely.
     triposr_decoder: nn.Module | None = None
     _density_activation = "exp"
     _density_bias = -1.0
-    try:
-        from tsr.system import TSR
-        _full = TSR.from_pretrained(args.model, config_name="config.yaml", weight_name="model.ckpt")
-        triposr_decoder = _full.decoder.to(device).eval()
-        for p in triposr_decoder.parameters():
-            p.requires_grad_(False)
-        _density_activation = _full.renderer.cfg.density_activation
-        _density_bias = float(_full.renderer.cfg.density_bias)
-        del _full
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        print(f"TripoSR decoder loaded (density_activation={_density_activation}, bias={_density_bias})")
-    except Exception as e:
-        print(f"Warning: could not load TripoSR decoder ({e}). NeRF sanity checks disabled.")
+    if is_main and args.use_nerf_vis:
+        try:
+            from tsr.system import TSR
+            _full = TSR.from_pretrained(args.model, config_name="config.yaml", weight_name="model.ckpt")
+            triposr_decoder = _full.decoder.to(device).eval()
+            for p in triposr_decoder.parameters():
+                p.requires_grad_(False)
+            _density_activation = _full.renderer.cfg.density_activation
+            _density_bias = float(_full.renderer.cfg.density_bias)
+            del _full
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print(f"TripoSR decoder loaded (density_activation={_density_activation}, bias={_density_bias})")
+        except Exception as e:
+            print(f"Warning: could not load TripoSR decoder ({e}). NeRF vis disabled.")
+    elif is_main:
+        print("[nerf_vis] Skipped TripoSR decoder load (USE_NERF_VIS=False).")
 
-    print(f"Dataset: {len(dataset)} points | "
-          f"{n_test} unseen UIDs, {len(test_view_names)} unseen views | "
-          f"radius={radius:.4f} | feat_dim={feat_dim}")
+    if is_main:
+        print(f"Dataset: {len(dataset)} points | "
+              f"{n_test} unseen UIDs, {len(test_view_names)} unseen views | "
+              f"radius={radius:.4f} | feat_dim={feat_dim}")
 
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
-                        num_workers=args.num_workers, pin_memory=True, drop_last=True)
+    if is_ddp:
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank,
+                                     shuffle=True, drop_last=True)
+        loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler,
+                            num_workers=args.num_workers, pin_memory=True, drop_last=True)
+    else:
+        sampler = None
+        loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
+                            num_workers=args.num_workers, pin_memory=True, drop_last=True)
 
     # ── Visualization samples ─────────────────────────────────────────────────
     def _pick_vis_from_uids(uid_set: set, n: int) -> list:
@@ -1574,8 +1483,9 @@ def run_train(args: argparse.Namespace) -> None:
         mlp_feat_dim = 0
         mlp_hidden_dim = args.hidden_dim_no_triplane
     mlp_in_dim: int = mlp_feat_dim + pe_dim
-    print(f"MLP input: {mlp_feat_dim}-dim triplane feats + {pe_dim}-dim PE = {mlp_in_dim}"
-          + ("" if args.use_triplane_features else f"  [PE-only ablation, hidden_dim={mlp_hidden_dim}]"))
+    if is_main:
+        print(f"MLP input: {mlp_feat_dim}-dim triplane feats + {pe_dim}-dim PE = {mlp_in_dim}"
+              + ("" if args.use_triplane_features else f"  [PE-only ablation, hidden_dim={mlp_hidden_dim}]"))
 
     global MLP_IN_DIM
     MLP_IN_DIM = mlp_in_dim
@@ -1597,45 +1507,54 @@ def run_train(args: argparse.Namespace) -> None:
         sdf_mlp.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch = ckpt.get("epoch", 0)
-        print(f"Resumed from {args.resume} at epoch {start_epoch}")
+        if is_main:
+            print(f"Resumed from {args.resume} at epoch {start_epoch}")
 
-    try:
-        derived_meta = {
-            "radius": radius,
-            "feature_reduction": feature_reduction,
-            "feat_dim": feat_dim,
-            "mlp_in_dim": mlp_in_dim,
-            "pe_dim": pe_dim,
-            "total_dataset_points": len(dataset),
-            "loader_batches_per_epoch": len(loader),
-            "n_train_uids": len(train_uids),
-            "n_test_uids": len(test_uids),
-            "n_train_views": len(train_view_names),
-            "n_test_views": len(test_view_names),
-            "start_epoch": start_epoch,
-        }
-        wb_config: dict = {
-            "globals": wandb_collect_module_globals(),
-            "args": {k: _wandb_jsonable(v) for k, v in vars(args).items()},
-            "derived": {k: _wandb_jsonable(v) for k, v in derived_meta.items()},
-        }
-        wb_config.update(wandb_model_parameter_config(sdf_mlp))
-        wandb.init(
-            project="simple-sdf",
-            name=args.run_name,
-            config=wb_config,
-            settings=wandb.Settings(_disable_stats=True, console="off"),
-        )
-        wandb_log_model_parameter_table(sdf_mlp)
-        if len(loader) > 0:
-            wandb.watch(
-                sdf_mlp,
-                log="all",
-                log_freq=max(1, len(loader)),
+    # ── DDP wrapping (after resume so we load into the raw module) ─────────────
+    if is_ddp:
+        sdf_mlp = DDP(sdf_mlp, device_ids=[local_rank])
+
+    # ── wandb (rank 0 only) ───────────────────────────────────────────────────
+    _mlp_module = sdf_mlp.module if is_ddp else sdf_mlp
+    if is_main:
+        try:
+            derived_meta = {
+                "radius": radius,
+                "feature_reduction": feature_reduction,
+                "feat_dim": feat_dim,
+                "mlp_in_dim": mlp_in_dim,
+                "pe_dim": pe_dim,
+                "total_dataset_points": len(dataset),
+                "loader_batches_per_epoch": len(loader),
+                "n_train_uids": len(train_uids),
+                "n_test_uids": len(test_uids),
+                "n_train_views": len(train_view_names),
+                "n_test_views": len(test_view_names),
+                "start_epoch": start_epoch,
+                "world_size": world_size,
+            }
+            wb_config: dict = {
+                "globals": wandb_collect_module_globals(),
+                "args": {k: _wandb_jsonable(v) for k, v in vars(args).items()},
+                "derived": {k: _wandb_jsonable(v) for k, v in derived_meta.items()},
+            }
+            wb_config.update(wandb_model_parameter_config(_mlp_module))
+            wandb.init(
+                project="simple-sdf",
+                name=args.run_name,
+                config=wb_config,
+                settings=wandb.Settings(_disable_stats=True, console="off"),
             )
-        wandb_enabled = True
-    except Exception as e:
-        print(f"Warning: wandb init failed: {e}")
+            wandb_log_model_parameter_table(_mlp_module)
+            if len(loader) > 0:
+                wandb.watch(
+                    _mlp_module,
+                    log="all",
+                    log_freq=max(1, len(loader)),
+                )
+            wandb_enabled = True
+        except Exception as e:
+            print(f"Warning: wandb init failed: {e}")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1644,10 +1563,12 @@ def run_train(args: argparse.Namespace) -> None:
 
     total_steps = args.epochs * len(loader)
     pbar = tqdm(total=total_steps, initial=start_epoch * len(loader),
-                desc=f"Epoch 1/{args.epochs}", dynamic_ncols=True, unit="step")
+                desc=f"Epoch 1/{args.epochs}", dynamic_ncols=True, unit="step") if is_main else None
 
     for epoch in range(start_epoch, args.epochs):
         sdf_mlp.train()
+        if sampler is not None:
+            sampler.set_epoch(epoch)
         epoch_loss = epoch_sdf = epoch_eik = 0.0
         diag_steps = 0
         diag_grad_mean_sum = 0.0
@@ -1657,7 +1578,8 @@ def run_train(args: argparse.Namespace) -> None:
         diag_pred_max = float("-inf")
         diag_tgt_min = float("inf")
         diag_tgt_max = float("-inf")
-        pbar.set_description(f"Epoch {epoch + 1}/{args.epochs}")
+        if pbar is not None:
+            pbar.set_description(f"Epoch {epoch + 1}/{args.epochs}")
 
         for base_feats, query_pts, sdf_gt, sid in loader:
             query_pts = query_pts.to(device).requires_grad_(True)
@@ -1679,7 +1601,7 @@ def run_train(args: argparse.Namespace) -> None:
                 model_feats = base_feats.to(device) if args.use_triplane_features else torch.empty(0)
 
             sdf_pred = sdf_mlp(model_feats)
-            sdf_loss = F.mse_loss(sdf_pred, sdf_gt)
+            sdf_loss = surface_weighted_mse_loss(sdf_pred, sdf_gt, sigma=args.surface_loss_sigma)
 
             gradients = torch.autograd.grad(
                 outputs=sdf_pred,
@@ -1717,12 +1639,13 @@ def run_train(args: argparse.Namespace) -> None:
             diag_tgt_min = min(diag_tgt_min, tgt_min_val)
             diag_tgt_max = max(diag_tgt_max, tgt_max_val)
 
-            pbar.update(1)
-            pbar.set_postfix(loss=f"{loss.item():.5f}",
-                             sdf=f"{sdf_loss.item():.5f}",
-                             eik=f"{eikonal_loss.item():.5f}")
+            if pbar is not None:
+                pbar.update(1)
+                pbar.set_postfix(loss=f"{loss.item():.5f}",
+                                 sdf=f"{sdf_loss.item():.5f}",
+                                 eik=f"{eikonal_loss.item():.5f}")
 
-            if wandb_enabled:
+            if is_main and wandb_enabled:
                 try:
                     wandb.log({
                         "train/loss": loss.item(),
@@ -1733,46 +1656,53 @@ def run_train(args: argparse.Namespace) -> None:
                     pass
 
         # ── End of epoch ──────────────────────────────────────────────────────
-        n = len(loader)
-        grad_mean_epoch = (diag_grad_mean_sum / diag_steps) if diag_steps > 0 else float("nan")
-        print(
-            f"[diag] epoch {epoch + 1:04d} | "
-            f"grad_norm(mean/min/max)={grad_mean_epoch:.4f}/{diag_grad_min:.4f}/{diag_grad_max:.4f} | "
-            f"pred_range=[{diag_pred_min:.4f}, {diag_pred_max:.4f}] | "
-            f"target_range=[{diag_tgt_min:.4f}, {diag_tgt_max:.4f}]"
-        )
-        if wandb_enabled:
-            try:
-                wandb.log({
-                    "train/epoch_loss": epoch_loss / n,
-                    "train/epoch_sdf_loss": epoch_sdf / n,
-                    "train/epoch_eikonal_loss": epoch_eik / n,
-                    "diag/grad_norm_mean": grad_mean_epoch,
-                    "diag/grad_norm_min": diag_grad_min,
-                    "diag/grad_norm_max": diag_grad_max,
-                    "diag/pred_min": diag_pred_min,
-                    "diag/pred_max": diag_pred_max,
-                    "diag/target_min": diag_tgt_min,
-                    "diag/target_max": diag_tgt_max,
-                    "train/epoch": epoch + 1,
-                })
-            except Exception:
-                pass
+        # Aggregate losses across ranks so rank-0 logs the global average.
+        if is_ddp:
+            t = torch.tensor([epoch_loss, epoch_sdf, epoch_eik], device=device)
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            epoch_loss, epoch_sdf, epoch_eik = (t / world_size).tolist()
+
+        if is_main:
+            n = len(loader)
+            grad_mean_epoch = (diag_grad_mean_sum / diag_steps) if diag_steps > 0 else float("nan")
+            print(
+                f"[diag] epoch {epoch + 1:04d} | "
+                f"grad_norm(mean/min/max)={grad_mean_epoch:.4f}/{diag_grad_min:.4f}/{diag_grad_max:.4f} | "
+                f"pred_range=[{diag_pred_min:.4f}, {diag_pred_max:.4f}] | "
+                f"target_range=[{diag_tgt_min:.4f}, {diag_tgt_max:.4f}]"
+            )
+            if wandb_enabled:
+                try:
+                    wandb.log({
+                        "train/epoch_loss": epoch_loss / n,
+                        "train/epoch_sdf_loss": epoch_sdf / n,
+                        "train/epoch_eikonal_loss": epoch_eik / n,
+                        "diag/grad_norm_mean": grad_mean_epoch,
+                        "diag/grad_norm_min": diag_grad_min,
+                        "diag/grad_norm_max": diag_grad_max,
+                        "diag/pred_min": diag_pred_min,
+                        "diag/pred_max": diag_pred_max,
+                        "diag/target_min": diag_tgt_min,
+                        "diag/target_max": diag_tgt_max,
+                        "train/epoch": epoch + 1,
+                    })
+                except Exception:
+                    pass
 
         is_last = (epoch + 1) == args.epochs
-        if is_last or (epoch + 1) % args.save_every == 0:
-            ckpt_path = output_dir / f"sdf_head_epoch{epoch + 1:04d}.pt"
+        if is_main and (is_last or (epoch + 1) % args.save_every == 0):
+            ckpt_path = output_dir / f"sdf_head_{RUN_NAME}_epoch{epoch + 1:04d}.pt"
             torch.save({
                 "epoch": epoch + 1,
-                "model": sdf_mlp.state_dict(),
+                "model": _mlp_module.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "meta": meta,
                 "args": vars(args),
             }, ckpt_path)
 
-        if args.vis_every > 0 and (epoch + 1) % args.vis_every == 0:
+        if is_main and args.vis_every > 0 and (epoch + 1) % args.vis_every == 0:
             visualize_reconstructions(
-                sdf_mlp=sdf_mlp,
+                sdf_mlp=_mlp_module,
                 seen_dirs=vis_seen_dirs,
                 unseen_dirs=vis_unseen_dirs,
                 radius=radius,
@@ -1784,42 +1714,52 @@ def run_train(args: argparse.Namespace) -> None:
                 device=device,
                 resolution=args.vis_resolution,
                 n_freqs=n_freqs,
-                elevation=args.elevation,
                 fov=args.fov,
                 image_size=args.image_size,
                 triposr_decoder=triposr_decoder,
                 density_activation=_density_activation,
                 density_bias=_density_bias,
-                nerf_threshold=NERF_DENSITY_THRESHOLD,
                 use_triplane_features=args.use_triplane_features,
             )
 
-    pbar.close()
+    if pbar is not None:
+        pbar.close()
 
-    if wandb_enabled:
-        try:
-            wandb.finish()
-        except Exception:
-            pass
-    print("\nTraining complete.")
+    if is_main:
+        if wandb_enabled:
+            try:
+                wandb.finish()
+            except Exception:
+                pass
+        print("\nTraining complete.")
+
+    if is_ddp:
+        dist.destroy_process_group()
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 def main() -> None:
+    # Allow train_sdf.sh (or any caller) to override the COMMAND constant via CLI.
+    _p = argparse.ArgumentParser(add_help=False)
+    _p.add_argument("--command", default=COMMAND,
+                    choices=("precompute", "train", "both"))
+    _cli, _ = _p.parse_known_args()
+    command = _cli.command
+
     args = argparse.Namespace(
         dataset_dir    = DATASET_DIR,
         model          = MODEL,
         n_objects      = N_OBJECTS,
         azimuths_per_mesh = AZIMUTHS_PER_MESH,
+        elevations     = ELEVATIONS,
+        near_surface_fraction = NEAR_SURFACE_FRACTION,
         n_points       = N_POINTS,
         image_size     = IMAGE_SIZE,
-        elevation      = ELEVATION,
         fov            = FOV,
         max_mesh_mb    = MAX_MESH_MB,
+        max_triangles  = MAX_TRIANGLES,
         verbose        = VERBOSE,
-        mc_resolution  = MC_RESOLUTION,
-        launch_viewer_after_precompute = LAUNCH_VIEWER_AFTER_PRECOMPUTE,
         output_dir     = OUTPUT_DIR,
         epochs         = EPOCHS,
         save_every     = SAVE_EVERY,
@@ -1828,8 +1768,9 @@ def main() -> None:
         n_hidden       = N_HIDDEN,
         n_freqs        = N_FREQS,
         lr             = LR,
-        eikonal_weight = EIKONAL_WEIGHT,
-        sdf_clamp      = SDF_CLAMP,
+        eikonal_weight      = EIKONAL_WEIGHT,
+        surface_loss_sigma  = SURFACE_LOSS_SIGMA,
+        sdf_clamp           = SDF_CLAMP,
         num_workers    = NUM_WORKERS,
         run_name       = RUN_NAME,
         weight_decay   = WEIGHT_DECAY,
@@ -1844,17 +1785,18 @@ def main() -> None:
         vis_resolution = VIS_RESOLUTION,
         batch_size     = BATCH_SIZE,
         resume         = RESUME,
+        use_nerf_vis   = USE_NERF_VIS,
     )
 
-    if COMMAND == "precompute":
+    if command == "precompute":
         run_precompute(args)
-    elif COMMAND == "train":
+    elif command == "train":
         run_train(args)
-    elif COMMAND == "both":
+    elif command == "both":
         run_precompute(args)
         run_train(args)
     else:
-        print(f"Unknown COMMAND: {COMMAND!r}")
+        print(f"Unknown command: {command!r}")
 
 
 if __name__ == "__main__":

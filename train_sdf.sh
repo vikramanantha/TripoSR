@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # train_sdf.sh  —  Run train_sdf_head.py
 #
-#   ./train_sdf.sh                  # precompute then train (default)
+#   ./train_sdf.sh                  # precompute then train on all GPUs (default)
 #   ./train_sdf.sh --precompute     # precompute only
 #   ./train_sdf.sh --train          # train only (dataset must exist)
 #
@@ -35,19 +35,14 @@ resolve_python() {
     exit 1
 }
 
-sed_inplace() {
-    # GNU sed accepts -i; BSD sed requires -i ''.
-    if sed --version >/dev/null 2>&1; then
-        sed -i "$@"
-    else
-        sed -i '' "$@"
-    fi
-}
-
 PYTHON="$(resolve_python)"
 
-# ── Parse optional flag ──────────────────────────────────────────────────────
-MODE="both"  # Default: precompute then train
+# Suppress Python library warnings (FutureWarning from transformers/torch etc.)
+# Set PYTHONWARNINGS=default before running to restore them.
+export PYTHONWARNINGS="${PYTHONWARNINGS:-ignore}"
+
+# ── Parse flag ───────────────────────────────────────────────────────────────
+MODE="both"
 for arg in "$@"; do
     case "$arg" in
         --precompute) MODE="precompute" ;;
@@ -56,13 +51,32 @@ for arg in "$@"; do
     esac
 done
 
-echo "Setting COMMAND -> $MODE"
-sed_inplace "s/^COMMAND[[:space:]]*=[[:space:]]*\"[^\"]*\"/COMMAND = \"$MODE\"/" "$PY_SCRIPT"
+# ── GPU detection ─────────────────────────────────────────────────────────────
+NGPUS=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l || echo 1)
+PORT=$((10000 + RANDOM % 20000))
 
-# In "both" mode the viewer would block between precompute and train — disable it.
-if [[ "$MODE" == "both" ]]; then
-    sed_inplace "s/^LAUNCH_VIEWER_AFTER_PRECOMPUTE[[:space:]]*=.*/LAUNCH_VIEWER_AFTER_PRECOMPUTE = False/" "$PY_SCRIPT"
-fi
+echo "Mode: $MODE | GPUs: $NGPUS | Port: $PORT"
+
+# ── Launch: torchrun for multi-GPU, plain python for single-GPU ───────────────
+# Uses "$PYTHON -m torch.distributed.run" so it always picks up the venv's torch.
+run() {
+    local cmd="$1"
+    if [[ "$NGPUS" -gt 1 ]]; then
+        "$PYTHON" -m torch.distributed.run \
+            --standalone \
+            --nnodes=1 \
+            --nproc_per_node="$NGPUS" \
+            --master_port="$PORT" \
+            "$PY_SCRIPT" --command "$cmd"
+    else
+        "$PYTHON" "$PY_SCRIPT" --command "$cmd"
+    fi
+}
 
 cd "$SCRIPT_DIR"
-exec "$PYTHON" "$PY_SCRIPT"
+
+case "$MODE" in
+    precompute) "$PYTHON" "$PY_SCRIPT" --command precompute ;;
+    train)      run train ;;
+    both)       "$PYTHON" "$PY_SCRIPT" --command precompute && run train ;;
+esac
