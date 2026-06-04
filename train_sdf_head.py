@@ -62,11 +62,11 @@ DATASET_DIR     = "/home/markiv/TripoSR/sdf_dataset"
 
 # ── Precompute ───────────────────────────────────────────────────────────────
 MODEL                 = "stabilityai/TripoSR"
-N_OBJECTS             = 25
+N_OBJECTS             = 100
 AZIMUTHS_PER_MESH     = 5              # × len(ELEVATIONS) = 10 views per object
 ELEVATIONS            = [15.0, 30.0]   # two elevation bands; replaces single ELEVATION
 N_POINTS              = 262144         # = 64^3
-NEAR_SURFACE_FRACTION = 0.0            # fully uniform in [-radius, radius]³; mimics MC inference grid
+NEAR_SURFACE_FRACTION = 0.25            # fully uniform in [-radius, radius]³; mimics MC inference grid
 IMAGE_SIZE            = 256
 FOV                   = 40.0
 MAX_MESH_MB           = 0.0
@@ -77,16 +77,17 @@ VERBOSE               = False
 OUTPUT_DIR      = "/home/markiv/TripoSR/sdf_checkpoints"
 EPOCHS          = 500
 SAVE_EVERY      = 25
-HIDDEN_DIM      = 256
+HIDDEN_DIM      = 128
 HIDDEN_DIM_NO_TRIPLANE = 256
-N_HIDDEN        = 10
+N_HIDDEN        = 6
 N_FREQS         = 6
 LR              = 1e-3
-EIKONAL_WEIGHT        = 1e-5
+LR_MIN          = 1e-5   # cosine annealing floor
+EIKONAL_WEIGHT        = 1e-3
 SURFACE_LOSS_SIGMA    = 0.05   # exp(-|sdf|/sigma) weighting; ~5% of object scale
 SDF_CLAMP             = 0.0
 NUM_WORKERS     = 4
-RUN_NAME        = "v0.41_25obj_unif"
+RUN_NAME        = "v0.44_100"
 TEST_FRACTION   = 0.2        # fraction of meshes (UIDs) held out as unseen
 TEST_VIEW_FRACTION = 0.2     # fraction of views held out per mesh
 VIS_EVERY       = 25
@@ -94,9 +95,10 @@ VIS_SEEN        = 3
 VIS_UNSEEN      = 3
 VIS_AZIMUTHS_PER_OBJECT = 5
 VIS_RESOLUTION  = 64
-BATCH_SIZE      = 4096
-RESUME          = None
-WEIGHT_DECAY    = 0
+BATCH_SIZE        = 4096
+SAMPLES_PER_BATCH = 4      # samples loaded per DataLoader step; points per step = SAMPLES_PER_BATCH × N_POINTS
+RESUME            = None
+WEIGHT_DECAY    = 1e-4
 USE_TANH_OUTPUT = False
 USE_TRIPLANE_FEATURES  = True   # ablation: set False to zero out triplane features (PE only)
 USE_NERF_VIS           = True  # load TripoSR decoder + render NeRF mesh during visualization
@@ -853,7 +855,7 @@ class SDFPointDataset(Dataset):
     """
 
     def __init__(self, dataset_dir: str, uid_whitelist: set | None = None,
-                 sample_whitelist: set | None = None):
+                 sample_whitelist: set | None = None, cache_subdir: str = "_flat_cache"):
         root = Path(dataset_dir)
         all_samples = sorted((root / "samples").glob("*/triplane.pt"))
         if uid_whitelist is not None:
@@ -875,7 +877,7 @@ class SDFPointDataset(Dataset):
         # Built once from the precomputed samples; on all subsequent runs every
         # process mmaps the same files so only the pages touched per batch are
         # paged in, and the OS shares physical pages across DDP ranks.
-        cache_dir  = root / "_flat_cache"
+        cache_dir  = root / cache_subdir
         cache_meta = cache_dir / "meta.json"
         sample_names = [p.parent.name for p in all_samples]
 
@@ -902,37 +904,76 @@ class SDFPointDataset(Dataset):
             path_to_si = {pp: i for i, pp in enumerate(ordered_dirs)}
             R_rows = [load_R_world_from_recon_json_strict(d) for d in ordered_dirs]
             R_stack = torch.from_numpy(np.stack(R_rows, axis=0)).float()
+            np.save(cache_dir / "R_stack.npy", R_stack.numpy())
 
-            pts_list, sdf_list, feats_list, sid_list = [], [], [], []
+            # ── Determine total points and feature dim from one sample ─────────
+            # n_points is fixed per sample (set at precompute time); feat_dim
+            # comes from the actual triplane query so we don't hard-code it.
+            n_pts_per_sample: int = self.meta["n_points"]
+            total_points = len(all_samples) * n_pts_per_sample
+            sp0 = all_samples[0]
+            _triplane0 = torch.load(sp0.parent / "triplane.pt", map_location="cpu",
+                                    weights_only=False).float()
+            _pts0 = torch.load(sp0.parent / "query_pts.pt", map_location="cpu",
+                               weights_only=False).clamp(-float(radius), float(radius))
+            with torch.no_grad():
+                _feats0 = query_triplane_features(
+                    _pts0 @ R_stack[path_to_si[sp0.parent]].T,
+                    _triplane0, radius, feature_reduction,
+                )
+            feat_dim_actual = _feats0.shape[-1]
+            del _triplane0, _pts0, _feats0
+            gc.collect()
+
+            print(f"  Allocating mmap: {total_points:,} pts × {feat_dim_actual}-dim feats "
+                  f"({total_points * feat_dim_actual * 4 / 1e9:.1f} GB on disk)")
+
+            # ── Pre-allocate output files as memory-mapped arrays ──────────────
+            # open_memmap writes a proper .npy header so np.load(mmap_mode='r')
+            # can read them back without any format conversion.
+            mm_feats = np.lib.format.open_memmap(
+                cache_dir / "feats.npy", mode="w+", dtype=np.float32,
+                shape=(total_points, feat_dim_actual))
+            mm_pts   = np.lib.format.open_memmap(
+                cache_dir / "pts.npy",   mode="w+", dtype=np.float32,
+                shape=(total_points, 3))
+            mm_sdf   = np.lib.format.open_memmap(
+                cache_dir / "sdf.npy",   mode="w+", dtype=np.float32,
+                shape=(total_points,))
+            mm_sid   = np.lib.format.open_memmap(
+                cache_dir / "sid.npy",   mode="w+", dtype=np.int64,
+                shape=(total_points,))
+
+            # ── Single pass: write each sample directly into its mmap slice ───
+            offset = 0
             for sp in tqdm(all_samples, desc="building cache", unit="sample", leave=False):
                 p = sp.parent
                 si = path_to_si[p]
                 triplane = torch.load(p / "triplane.pt", map_location="cpu",
                                       weights_only=False).float()
                 pts = torch.load(p / "query_pts.pt", map_location="cpu",
-                                 weights_only=False)
+                                 weights_only=False).clamp(-float(radius), float(radius))
                 sdf = torch.load(p / "sdf_gt.pt",    map_location="cpu",
                                  weights_only=False)
-                pts = pts.clamp(-float(radius), float(radius))
                 with torch.no_grad():
-                    pts_trip = pts @ R_stack[si].T
-                    feats = query_triplane_features(pts_trip, triplane, radius,
-                                                   feature_reduction)
-                pts_list.append(pts.numpy())
-                sdf_list.append(sdf.numpy())
-                feats_list.append(feats.numpy())
-                sid_list.append(np.full(pts.shape[0], si, dtype=np.int64))
-                del triplane, pts, sdf, feats, pts_trip
+                    feats = query_triplane_features(
+                        pts @ R_stack[si].T, triplane, radius, feature_reduction)
 
-            np.save(cache_dir / "feats.npy",   np.concatenate(feats_list, axis=0))
-            np.save(cache_dir / "pts.npy",     np.concatenate(pts_list,   axis=0))
-            np.save(cache_dir / "sdf.npy",     np.concatenate(sdf_list,   axis=0))
-            np.save(cache_dir / "sid.npy",     np.concatenate(sid_list,   axis=0))
-            np.save(cache_dir / "R_stack.npy", R_stack.numpy())
+                n = pts.shape[0]
+                mm_feats[offset : offset + n] = feats.numpy()
+                mm_pts  [offset : offset + n] = pts.numpy()
+                mm_sdf  [offset : offset + n] = sdf.numpy()
+                mm_sid  [offset : offset + n] = si
+                offset += n
+
+                del triplane, pts, sdf, feats
+
+            mm_feats.flush(); mm_pts.flush(); mm_sdf.flush(); mm_sid.flush()
+            del mm_feats, mm_pts, mm_sdf, mm_sid
+            gc.collect()
+
             with open(cache_meta, "w") as f:
                 json.dump({"sample_names": sample_names}, f)
-            del pts_list, sdf_list, feats_list, sid_list
-            gc.collect()
             print(f"Cache built → {cache_dir}")
 
         # mmap: the OS pages in only what each batch touches, shared across ranks
@@ -953,6 +994,64 @@ class SDFPointDataset(Dataset):
         # numpy memmap indexing returns ndarray; DataLoader collate converts to tensor
         return (self.all_feats[idx], self.all_pts[idx],
                 self.all_sdf[idx],   self.point_sample_id[idx])
+
+
+# ─── Lazy dataset (no flat cache) ────────────────────────────────────────────
+
+class SDFLazyDataset(Dataset):
+    """Per-sample lazy loader — no flat cache.
+
+    Each __getitem__ loads one sample's triplane.pt / query_pts.pt / sdf_gt.pt,
+    queries the triplane at all query points, and returns:
+        feats    : (N_POINTS, feat_dim)   — triplane features, CPU float32
+        pts_trip : (N_POINTS, 3)          — query pts in triplane frame, CPU float32
+        sdf      : (N_POINTS,)            — ground-truth SDF, CPU float32
+
+    pts_trip is already rotated into the TripoSR coordinate frame, so the
+    training loop can pass it directly to fourier_encode and to autograd for
+    the eikonal loss without any per-sample R-matrix lookup.
+    """
+
+    def __init__(self, dataset_dir: str, uid_whitelist: set | None = None,
+                 sample_whitelist: set | None = None):
+        root = Path(dataset_dir)
+        all_samples = sorted((root / "samples").glob("*/triplane.pt"))
+        if uid_whitelist is not None:
+            all_samples = [p for p in all_samples
+                           if p.parent.name.split("_az")[0] in uid_whitelist]
+        if sample_whitelist is not None:
+            all_samples = [p for p in all_samples
+                           if p.parent.name in sample_whitelist]
+        if not all_samples:
+            raise RuntimeError(f"No precomputed samples found under {root}/samples/")
+
+        with open(root / "metadata.json") as f:
+            self.meta: dict = json.load(f)
+
+        self.radius: float = float(self.meta["radius"])
+        self.feature_reduction: str = self.meta["feature_reduction"]
+        self.sample_dirs: list[Path] = [p.parent for p in all_samples]
+        self.R_list: list[np.ndarray] = [
+            load_R_world_from_recon_json_strict(d) for d in self.sample_dirs
+        ]
+
+    def __len__(self) -> int:
+        return len(self.sample_dirs)
+
+    def __getitem__(self, idx: int):
+        p   = self.sample_dirs[idx]
+        R   = torch.from_numpy(self.R_list[idx]).float()
+        triplane = torch.load(p / "triplane.pt", map_location="cpu",
+                              weights_only=False).float()
+        pts = torch.load(p / "query_pts.pt", map_location="cpu",
+                         weights_only=False).clamp(-self.radius, self.radius)
+        sdf = torch.load(p / "sdf_gt.pt", map_location="cpu", weights_only=False)
+        with torch.no_grad():
+            pts_trip = pts @ R.T
+            feats = query_triplane_features(pts_trip, triplane, self.radius,
+                                            self.feature_reduction)
+        del triplane
+        return feats, pts_trip, sdf
 
 
 # ─── Visualization helpers ────────────────────────────────────────────────────
@@ -1400,17 +1499,28 @@ def run_train(args: argparse.Namespace) -> None:
     else:
         train_view_names = set(train_sample_names)
 
-    # Rank 0 builds the flat cache; other ranks wait then load via mmap.
-    if is_ddp and not is_main:
-        dist.barrier()
-    dataset = SDFPointDataset(args.dataset_dir, sample_whitelist=train_view_names)
-    if is_ddp and is_main:
-        dist.barrier()
+    # No flat cache — each rank loads per-sample .pt files on the fly.
+    dataset = SDFLazyDataset(args.dataset_dir, sample_whitelist=train_view_names)
     meta = dataset.meta
-    radius: float = meta["radius"]
+    radius: float = float(meta["radius"])
     feature_reduction: str = meta["feature_reduction"]
     feat_dim: int = meta["feat_dim"]
-    R_stack_device = dataset.R_stack.to(device)
+    n_pts_per_sample: int = meta["n_points"]
+
+    # ── Test dataset (rank 0 only — eval never runs on other ranks) ───────────
+    test_dataset: SDFLazyDataset | None = None
+    test_loader = None
+    if is_main:
+        test_sample_names = (
+            {s for s in all_sample_names if s.split("_az")[0] in test_uids}
+            | test_view_names
+        )
+        if test_sample_names:
+            test_dataset = SDFLazyDataset(args.dataset_dir, sample_whitelist=test_sample_names)
+            test_loader = DataLoader(test_dataset, batch_size=args.samples_per_batch,
+                                     shuffle=False, num_workers=args.num_workers, pin_memory=False)
+            print(f"Test dataset: {len(test_dataset)} samples  "
+                  f"({len(test_uids)} unseen UIDs + {len(test_view_names)} unseen views)")
 
     # ── Optionally load frozen TripoSR decoder for NeRF sanity-check mesh ────
     # Only rank 0 runs visualization, so other ranks skip the decoder entirely.
@@ -1436,19 +1546,19 @@ def run_train(args: argparse.Namespace) -> None:
         print("[nerf_vis] Skipped TripoSR decoder load (USE_NERF_VIS=False).")
 
     if is_main:
-        print(f"Dataset: {len(dataset)} points | "
+        print(f"Dataset: {len(dataset)} samples ({len(dataset) * n_pts_per_sample:,} points) | "
               f"{n_test} unseen UIDs, {len(test_view_names)} unseen views | "
               f"radius={radius:.4f} | feat_dim={feat_dim}")
 
     if is_ddp:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank,
                                      shuffle=True, drop_last=True)
-        loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler,
-                            num_workers=args.num_workers, pin_memory=True, drop_last=True)
+        loader = DataLoader(dataset, batch_size=args.samples_per_batch, sampler=sampler,
+                            num_workers=args.num_workers, pin_memory=False, drop_last=True)
     else:
         sampler = None
-        loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
-                            num_workers=args.num_workers, pin_memory=True, drop_last=True)
+        loader = DataLoader(dataset, batch_size=args.samples_per_batch, shuffle=True,
+                            num_workers=args.num_workers, pin_memory=False, drop_last=True)
 
     # ── Visualization samples ─────────────────────────────────────────────────
     def _pick_vis_from_uids(uid_set: set, n: int) -> list:
@@ -1499,6 +1609,9 @@ def run_train(args: argparse.Namespace) -> None:
         pe_dim=pe_dim,
     ).to(device)
     optimizer = torch.optim.AdamW(sdf_mlp.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=args.lr_min
+    )
 
     # ── Resume ────────────────────────────────────────────────────────────────
     start_epoch = 0
@@ -1506,6 +1619,8 @@ def run_train(args: argparse.Namespace) -> None:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         sdf_mlp.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
         start_epoch = ckpt.get("epoch", 0)
         if is_main:
             print(f"Resumed from {args.resume} at epoch {start_epoch}")
@@ -1561,15 +1676,19 @@ def run_train(args: argparse.Namespace) -> None:
 
     # ── Training loop ─────────────────────────────────────────────────────────
 
-    total_steps = args.epochs * len(loader)
-    pbar = tqdm(total=total_steps, initial=start_epoch * len(loader),
+    # Each outer loader step covers samples_per_batch × n_pts points split into
+    # batch_size mini-batches — total gradient steps per epoch is the same order
+    # as the old flat-cache approach.
+    steps_per_outer = max(1, (args.samples_per_batch * n_pts_per_sample) // args.batch_size)
+    total_steps = args.epochs * len(loader) * steps_per_outer
+    pbar = tqdm(total=total_steps, initial=start_epoch * len(loader) * steps_per_outer,
                 desc=f"Epoch 1/{args.epochs}", dynamic_ncols=True, unit="step") if is_main else None
 
     for epoch in range(start_epoch, args.epochs):
         sdf_mlp.train()
         if sampler is not None:
             sampler.set_epoch(epoch)
-        epoch_loss = epoch_sdf = epoch_eik = 0.0
+        epoch_loss = epoch_sdf = epoch_mse = epoch_eik = 0.0
         diag_steps = 0
         diag_grad_mean_sum = 0.0
         diag_grad_min = float("inf")
@@ -1581,86 +1700,100 @@ def run_train(args: argparse.Namespace) -> None:
         if pbar is not None:
             pbar.set_description(f"Epoch {epoch + 1}/{args.epochs}")
 
-        for base_feats, query_pts, sdf_gt, sid in loader:
-            query_pts = query_pts.to(device).requires_grad_(True)
-            sdf_gt = sdf_gt.to(device)
-            sid = sid.to(device)
+        for sample_feats, sample_pts_trip, sample_sdf in loader:
+            # sample_feats:     (S, N, feat_dim) — triplane features, CPU
+            # sample_pts_trip:  (S, N, 3)        — query pts in triplane frame, CPU
+            # sample_sdf:       (S, N)            — GT SDF, CPU
+            S, N = sample_sdf.shape
 
-            if n_freqs > 0:
-                Rs = R_stack_device
-                trip = query_pts.detach()
-                for u in sid.unique():
-                    m = sid == u
-                    trip = trip.clone()
-                    trip[m] = query_pts[m] @ Rs[u.long()].T
-                if args.use_triplane_features:
-                    model_feats = torch.cat([base_feats.to(device), fourier_encode(trip, n_freqs)], dim=-1)
+            # Flatten all S samples' points and shuffle for cross-sample mixing
+            feats_flat = sample_feats.view(S * N, -1)
+            pts_flat   = sample_pts_trip.view(S * N, 3)
+            sdf_flat   = sample_sdf.view(S * N)
+            perm = torch.randperm(S * N)
+            feats_flat = feats_flat[perm]
+            pts_flat   = pts_flat[perm]
+            sdf_flat   = sdf_flat[perm]
+
+            for start in range(0, S * N, args.batch_size):
+                end = min(start + args.batch_size, S * N)
+                base_feats = feats_flat[start:end]
+                # pts already in triplane frame — used directly for PE and eikonal
+                query_pts  = pts_flat[start:end].to(device).requires_grad_(True)
+                sdf_gt     = sdf_flat[start:end].to(device)
+
+                if n_freqs > 0:
+                    if args.use_triplane_features:
+                        model_feats = torch.cat(
+                            [base_feats.to(device), fourier_encode(query_pts, n_freqs)], dim=-1)
+                    else:
+                        model_feats = fourier_encode(query_pts, n_freqs)
                 else:
-                    model_feats = fourier_encode(trip, n_freqs)
-            else:
-                model_feats = base_feats.to(device) if args.use_triplane_features else torch.empty(0)
+                    model_feats = base_feats.to(device) if args.use_triplane_features else torch.empty(0)
 
-            sdf_pred = sdf_mlp(model_feats)
-            sdf_loss = surface_weighted_mse_loss(sdf_pred, sdf_gt, sigma=args.surface_loss_sigma)
+                sdf_pred = sdf_mlp(model_feats)
+                sdf_loss = surface_weighted_mse_loss(sdf_pred, sdf_gt, sigma=args.surface_loss_sigma)
 
-            gradients = torch.autograd.grad(
-                outputs=sdf_pred,
-                inputs=query_pts,
-                grad_outputs=torch.ones_like(sdf_pred),
-                create_graph=True,
-                retain_graph=True,
-            )[0]
-            grad_norm = gradients.norm(dim=-1)
-            eikonal_loss = ((grad_norm - 1.0) ** 2).mean()
+                gradients = torch.autograd.grad(
+                    outputs=sdf_pred,
+                    inputs=query_pts,
+                    grad_outputs=torch.ones_like(sdf_pred),
+                    create_graph=True,
+                    retain_graph=True,
+                )[0]
+                grad_norm = gradients.norm(dim=-1)
+                eikonal_loss = ((grad_norm - 1.0) ** 2).mean()
 
-            loss = sdf_loss + args.eikonal_weight * eikonal_loss
+                loss = sdf_loss + args.eikonal_weight * eikonal_loss
 
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(sdf_mlp.parameters(), 1.0)
-            optimizer.step()
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(sdf_mlp.parameters(), 1.0)
+                optimizer.step()
 
-            epoch_loss += loss.item()
-            epoch_sdf += sdf_loss.item()
-            epoch_eik += eikonal_loss.item()
-            diag_steps += 1
-            grad_mean_val = float(grad_norm.mean().detach().item())
-            grad_min_val = float(grad_norm.min().detach().item())
-            grad_max_val = float(grad_norm.max().detach().item())
-            pred_min_val = float(sdf_pred.min().detach().item())
-            pred_max_val = float(sdf_pred.max().detach().item())
-            tgt_min_val = float(sdf_gt.min().detach().item())
-            tgt_max_val = float(sdf_gt.max().detach().item())
-            diag_grad_mean_sum += grad_mean_val
-            diag_grad_min = min(diag_grad_min, grad_min_val)
-            diag_grad_max = max(diag_grad_max, grad_max_val)
-            diag_pred_min = min(diag_pred_min, pred_min_val)
-            diag_pred_max = max(diag_pred_max, pred_max_val)
-            diag_tgt_min = min(diag_tgt_min, tgt_min_val)
-            diag_tgt_max = max(diag_tgt_max, tgt_max_val)
+                epoch_loss += loss.item()
+                epoch_sdf  += sdf_loss.item()
+                epoch_mse  += F.mse_loss(sdf_pred.detach(), sdf_gt).item()
+                epoch_eik  += eikonal_loss.item()
+                diag_steps += 1
 
-            if pbar is not None:
-                pbar.update(1)
-                pbar.set_postfix(loss=f"{loss.item():.5f}",
-                                 sdf=f"{sdf_loss.item():.5f}",
-                                 eik=f"{eikonal_loss.item():.5f}")
+                grad_mean_val = float(grad_norm.mean().detach().item())
+                grad_min_val  = float(grad_norm.min().detach().item())
+                grad_max_val  = float(grad_norm.max().detach().item())
+                pred_min_val  = float(sdf_pred.min().detach().item())
+                pred_max_val  = float(sdf_pred.max().detach().item())
+                tgt_min_val   = float(sdf_gt.min().detach().item())
+                tgt_max_val   = float(sdf_gt.max().detach().item())
+                diag_grad_mean_sum += grad_mean_val
+                diag_grad_min = min(diag_grad_min, grad_min_val)
+                diag_grad_max = max(diag_grad_max, grad_max_val)
+                diag_pred_min = min(diag_pred_min, pred_min_val)
+                diag_pred_max = max(diag_pred_max, pred_max_val)
+                diag_tgt_min  = min(diag_tgt_min,  tgt_min_val)
+                diag_tgt_max  = max(diag_tgt_max,  tgt_max_val)
 
-            if is_main and wandb_enabled:
-                try:
-                    wandb.log({
-                        "train/loss": loss.item(),
-                        "train/sdf_loss": sdf_loss.item(),
-                        "train/eikonal_loss": eikonal_loss.item(),
-                    })
-                except Exception:
-                    pass
+                if pbar is not None:
+                    pbar.update(1)
+                    pbar.set_postfix(loss=f"{loss.item():.5f}",
+                                     sdf=f"{sdf_loss.item():.5f}",
+                                     eik=f"{eikonal_loss.item():.5f}")
+
+                if is_main and wandb_enabled:
+                    try:
+                        wandb.log({
+                            "train/loss": loss.item(),
+                            "train/sdf_loss": sdf_loss.item(),
+                            "train/eikonal_loss": eikonal_loss.item(),
+                        })
+                    except Exception:
+                        pass
 
         # ── End of epoch ──────────────────────────────────────────────────────
         # Aggregate losses across ranks so rank-0 logs the global average.
         if is_ddp:
-            t = torch.tensor([epoch_loss, epoch_sdf, epoch_eik], device=device)
+            t = torch.tensor([epoch_loss, epoch_sdf, epoch_mse, epoch_eik], device=device)
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
-            epoch_loss, epoch_sdf, epoch_eik = (t / world_size).tolist()
+            epoch_loss, epoch_sdf, epoch_mse, epoch_eik = (t / world_size).tolist()
 
         if is_main:
             n = len(loader)
@@ -1676,6 +1809,7 @@ def run_train(args: argparse.Namespace) -> None:
                     wandb.log({
                         "train/epoch_loss": epoch_loss / n,
                         "train/epoch_sdf_loss": epoch_sdf / n,
+                        "train/epoch_mse": epoch_mse / n,
                         "train/epoch_eikonal_loss": epoch_eik / n,
                         "diag/grad_norm_mean": grad_mean_epoch,
                         "diag/grad_norm_min": diag_grad_min,
@@ -1689,13 +1823,62 @@ def run_train(args: argparse.Namespace) -> None:
                 except Exception:
                     pass
 
+        # ── Test evaluation (rank 0 only) ─────────────────────────────────────
+        if is_main and test_loader is not None:
+            _mlp_module.eval()
+            test_weighted_sum = test_mse_sum = 0.0
+            test_steps = 0
+            with torch.no_grad():
+                for t_feats, t_pts_trip, t_sdf in test_loader:
+                    # shapes: (S, N, feat_dim), (S, N, 3), (S, N)
+                    tS, tN = t_sdf.shape
+                    tf = t_feats.view(tS * tN, -1).to(device)
+                    tp = t_pts_trip.view(tS * tN, 3).to(device)
+                    ts = t_sdf.view(tS * tN).to(device)
+                    for ts_start in range(0, tS * tN, args.batch_size):
+                        ts_end = min(ts_start + args.batch_size, tS * tN)
+                        mf = tf[ts_start:ts_end]
+                        mp = tp[ts_start:ts_end]
+                        ms = ts[ts_start:ts_end]
+                        if n_freqs > 0:
+                            if args.use_triplane_features:
+                                t_model_feats = torch.cat([mf, fourier_encode(mp, n_freqs)], dim=-1)
+                            else:
+                                t_model_feats = fourier_encode(mp, n_freqs)
+                        else:
+                            t_model_feats = mf if args.use_triplane_features else torch.empty(0)
+                        t_pred = _mlp_module(t_model_feats)
+                        test_weighted_sum += surface_weighted_mse_loss(t_pred, ms, sigma=args.surface_loss_sigma).item()
+                        test_mse_sum += F.mse_loss(t_pred, ms).item()
+                        test_steps += 1
+            _mlp_module.train()
+            if wandb_enabled and test_steps > 0:
+                try:
+                    wandb.log({
+                        "test/epoch_sdf_loss": test_weighted_sum / test_steps,
+                        "test/epoch_mse": test_mse_sum / test_steps,
+                        "train/epoch": epoch + 1,
+                    })
+                except Exception:
+                    pass
+
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
+        if is_main and wandb_enabled:
+            try:
+                wandb.log({"train/lr": current_lr, "train/epoch": epoch + 1})
+            except Exception:
+                pass
+
         is_last = (epoch + 1) == args.epochs
         if is_main and (is_last or (epoch + 1) % args.save_every == 0):
             ckpt_path = output_dir / f"sdf_head_{RUN_NAME}_epoch{epoch + 1:04d}.pt"
+            ckpt_path.parent.mkdir(parents=True, exist_ok=True)
             torch.save({
                 "epoch": epoch + 1,
                 "model": _mlp_module.state_dict(),
                 "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
                 "meta": meta,
                 "args": vars(args),
             }, ckpt_path)
@@ -1768,6 +1951,7 @@ def main() -> None:
         n_hidden       = N_HIDDEN,
         n_freqs        = N_FREQS,
         lr             = LR,
+        lr_min         = LR_MIN,
         eikonal_weight      = EIKONAL_WEIGHT,
         surface_loss_sigma  = SURFACE_LOSS_SIGMA,
         sdf_clamp           = SDF_CLAMP,
@@ -1783,7 +1967,8 @@ def main() -> None:
         vis_unseen     = VIS_UNSEEN,
         vis_azimuths_per_object = VIS_AZIMUTHS_PER_OBJECT,
         vis_resolution = VIS_RESOLUTION,
-        batch_size     = BATCH_SIZE,
+        batch_size        = BATCH_SIZE,
+        samples_per_batch = SAMPLES_PER_BATCH,
         resume         = RESUME,
         use_nerf_vis   = USE_NERF_VIS,
     )
