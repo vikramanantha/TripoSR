@@ -44,6 +44,7 @@ import gc
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
@@ -221,12 +222,28 @@ def _combined_three_way_overlay(
 
 # ─── Gradio viewer ────────────────────────────────────────────────────────────
 
+def _format_timing_table(timing: dict) -> str:
+    """Format a timing dict as a Gradio-friendly markdown table."""
+    model_keys = {"SDF MLP checkpoint load", "TripoSR model load"}
+    pipeline_total = sum(v for k, v in timing.items() if k not in model_keys)
+    grand_total = sum(timing.values())
+
+    rows = ["| Stage | Time |", "|:------|-----:|"]
+    for label, seconds in timing.items():
+        rows.append(f"| {label} | {seconds:.2f} s |")
+    rows.append("|  |  |")
+    rows.append(f"| **Pipeline total** (excl. model loads) | **{pipeline_total:.2f} s** |")
+    rows.append(f"| **Grand total** | **{grand_total:.2f} s** |")
+    return "### Inference Timing\n\n" + "\n".join(rows)
+
+
 def launch_three_way_viewer(
     source_mesh_path: str,
     nerf_mesh_path: str | None,
     sdf_mesh_path: str,
     render_image_path: str | None,
     output_dir: str,
+    timing: dict | None = None,
     port: int = 7861,
     listen: bool = False,
     share: bool = True,
@@ -262,6 +279,8 @@ def launch_three_way_viewer(
             "**Orange** = SDF MLP prediction  \n"
             "Drag to rotate · scroll to zoom · axes: +X red, +Y green, +Z blue"
         )
+        if timing:
+            gr.Markdown(_format_timing_table(timing))
 
         # Top row: individual meshes
         with gr.Row(equal_height=True):
@@ -329,9 +348,13 @@ def run_inference(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    timing: dict = {}
+
     # ── 1. Load SDF MLP checkpoint ────────────────────────────────────────────
     print(f"\n[1/5] Loading SDF MLP checkpoint: {args.checkpoint}")
+    _t = time.perf_counter()
     sdf_mlp, meta, saved_args = load_sdf_mlp_from_checkpoint(args.checkpoint, device)
+    timing["SDF MLP checkpoint load"] = time.perf_counter() - _t
     radius: float = meta["radius"]
     feature_reduction: str = meta["feature_reduction"]
     n_freqs: int = getattr(saved_args, "n_freqs", 0)
@@ -341,11 +364,13 @@ def run_inference(args: argparse.Namespace) -> None:
     print(f"\n[2/5] Loading TripoSR ({args.model})...")
     from tsr.system import TSR
 
+    _t = time.perf_counter()
     triposr = TSR.from_pretrained(args.model, config_name="config.yaml", weight_name="model.ckpt")
     triposr.renderer.set_chunk_size(8192)
     triposr.to(device).eval()
     for p in triposr.parameters():
         p.requires_grad_(False)
+    timing["TripoSR model load"] = time.perf_counter() - _t
 
     triposr_decoder = triposr.decoder
     _density_activation: str = triposr.renderer.cfg.density_activation
@@ -364,9 +389,11 @@ def run_inference(args: argparse.Namespace) -> None:
         if not os.path.exists(mesh_path):
             raise FileNotFoundError(f"Mesh not found: {mesh_path}")
 
+    _t = time.perf_counter()
     mesh = load_and_normalize_mesh(mesh_path, radius)
     source_obj_path = str(output_dir / "source_mesh.obj")
     mesh.export(source_obj_path)
+    timing["Mesh load & normalize"] = time.perf_counter() - _t
     print(f"[mesh] Normalised source ({len(mesh.vertices):,}v, {len(mesh.faces):,}f) → {source_obj_path}")
 
     # ── 4. Render + TripoSR triplane extraction ───────────────────────────────
@@ -375,6 +402,7 @@ def run_inference(args: argparse.Namespace) -> None:
     extrinsics_path = output_dir / "camera_extrinsics.json"
     render_path = str(output_dir / "input_render.png")
 
+    _t = time.perf_counter()
     pil_image = render_mesh_to_image(
         mesh,
         elevation=args.elevation,
@@ -384,14 +412,17 @@ def run_inference(args: argparse.Namespace) -> None:
         extrinsics_json_path=str(extrinsics_path),
     )
     pil_image.save(render_path)
+    timing["Render to image"] = time.perf_counter() - _t
     print(f"[render] Input image → {render_path}")
 
     # Re-load the saved PNG as a NumPy array — byte-identical to precompute.
     image_np = np.array(Image.open(render_path).convert("RGB"))
 
+    _t = time.perf_counter()
     with torch.no_grad():
         scene_codes = triposr([image_np], device=device)
     triplane = scene_codes[0].float()
+    timing["TripoSR triplane extraction"] = time.perf_counter() - _t
     print(f"[triposr] Triplane shape: {tuple(triplane.shape)}")
 
     # R maps TripoSR recon frame → normalised mesh world frame.
@@ -404,6 +435,7 @@ def run_inference(args: argparse.Namespace) -> None:
     print(f"\n[5/5] Marching cubes (resolution={args.mc_resolution})...")
 
     print("[reconstruct] SDF MLP ...")
+    _t = time.perf_counter()
     sdf_mesh = reconstruct_mesh_from_triplane(
         sdf_mlp,
         triplane,
@@ -415,6 +447,7 @@ def run_inference(args: argparse.Namespace) -> None:
         R_world_from_trip=R_np,
         use_triplane_features=use_triplane,
     )
+    timing["SDF MLP marching cubes"] = time.perf_counter() - _t
     if sdf_mesh is None:
         print("[warning] SDF MLP marching cubes: no zero crossing found.")
         sdf_obj_path = None
@@ -424,6 +457,7 @@ def run_inference(args: argparse.Namespace) -> None:
         print(f"[sdf_mlp] → {sdf_obj_path}  ({len(sdf_mesh.vertices):,}v, {len(sdf_mesh.faces):,}f)")
 
     print("[reconstruct] TripoSR NeRF decoder ...")
+    _t = time.perf_counter()
     nerf_mesh = reconstruct_mesh_nerf_decoder(
         triposr_decoder,
         triplane,
@@ -436,6 +470,7 @@ def run_inference(args: argparse.Namespace) -> None:
         device=device,
         R_world_from_trip=R_np,
     )
+    timing["NeRF decoder marching cubes"] = time.perf_counter() - _t
     if nerf_mesh is None:
         print("[warning] NeRF decoder marching cubes: no surface found.")
         nerf_obj_path = None
@@ -461,6 +496,7 @@ def run_inference(args: argparse.Namespace) -> None:
         sdf_mesh_path=sdf_obj_path,
         render_image_path=render_path,
         output_dir=str(output_dir),
+        timing=timing,
         port=args.port,
         listen=args.listen,
         share=True,
