@@ -31,6 +31,7 @@ os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 sys.path.insert(0, str(Path(__file__).parent))
 
 import argparse
+import math
 import random
 import types
 
@@ -102,7 +103,7 @@ AUGMENT_BUDGET_SEC    = 20     # wall-clock budget for the per-step trimesh augm
 NCCL_TIMEOUT_MIN      = 30     # DDP collective timeout (headroom for slow augment steps)
 SDF_CLAMP             = 0.0
 NUM_WORKERS     = 4
-RUN_NAME        = "v0.52_100"
+RUN_NAME        = "v0.61_100"
 TEST_FRACTION   = 0.2        # fraction of meshes (UIDs) held out as unseen
 TEST_VIEW_FRACTION = 0.2     # fraction of views held out per mesh
 VIS_EVERY       = 25
@@ -117,6 +118,14 @@ WEIGHT_DECAY    = 1e-4
 USE_TANH_OUTPUT = False
 USE_TRIPLANE_FEATURES  = True   # ablation: set False to zero out triplane features (PE only)
 USE_NERF_VIS           = True  # load TripoSR decoder + render NeRF mesh during visualization
+
+# ── LoRA fine-tuning ─────────────────────────────────────────────────────────
+LORA_RANK              = 16
+LORA_ALPHA             = 16.0   # LoRA scale = alpha / rank (1.0 = no extra scaling)
+LORA_BLOCK_START       = 0      # first backbone block to adapt (0-indexed, inclusive); 0 = all layers
+LORA_BLOCK_END         = 16     # exclusive end; 16 = through the last block (clamped to block count)
+LORA_LR                = 1e-4   # separate LR for LoRA adapters + post_processor
+LORA_WEIGHT_DECAY      = 1e-4
 
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -358,6 +367,65 @@ def fourier_encode(pts: torch.Tensor, n_freqs: int = 6) -> torch.Tensor:
     freqs = 2.0 ** torch.arange(n_freqs, dtype=pts.dtype, device=pts.device)
     x = pts[..., :, None] * freqs
     return torch.cat([pts, torch.sin(x).flatten(-2), torch.cos(x).flatten(-2)], dim=-1)
+
+
+# ─── LoRA ────────────────────────────────────────────────────────────────────
+
+class LoRALinear(nn.Module):
+    """Frozen nn.Linear with a trainable low-rank perturbation ΔW = B·A·scale."""
+
+    def __init__(self, base: nn.Linear, rank: int, alpha: float):
+        super().__init__()
+        self.base = base
+        self.scale = alpha / rank
+        d_out, d_in = base.weight.shape
+        self.lora_A = nn.Parameter(torch.empty(rank, d_in))
+        self.lora_B = nn.Parameter(torch.zeros(d_out, rank))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.base(x) + (x @ self.lora_A.T @ self.lora_B.T) * self.scale
+
+
+def _lora_attn(attn, rank: int, alpha: float) -> None:
+    """Replace to_q/k/v/out in an Attention module with LoRALinear in-place."""
+    attn.to_q = LoRALinear(attn.to_q, rank, alpha)
+    if attn.to_k is not None:
+        attn.to_k = LoRALinear(attn.to_k, rank, alpha)
+    if attn.to_v is not None:
+        attn.to_v = LoRALinear(attn.to_v, rank, alpha)
+    attn.to_out[0] = LoRALinear(attn.to_out[0], rank, alpha)
+
+
+def _lora_ff(ff, rank: int, alpha: float) -> None:
+    """Apply LoRA to the gate projection and output projection in a GEGLU FFN."""
+    gate = ff.net[0]
+    if hasattr(gate, "proj"):
+        gate.proj = LoRALinear(gate.proj, rank, alpha)
+    out_proj = ff.net[2]
+    if isinstance(out_proj, nn.Linear):
+        ff.net[2] = LoRALinear(out_proj, rank, alpha)
+
+
+def apply_lora_to_triposr(triposr_model, start_block: int, end_block: int,
+                           rank: int, alpha: float) -> list:
+    """Freeze all TripoSR params; inject LoRA into backbone blocks [start, end);
+    fully unfreeze post_processor.  Returns the list of all trainable parameters."""
+    for p in triposr_model.parameters():
+        p.requires_grad_(False)
+
+    blocks = triposr_model.backbone.transformer_blocks
+    for i in range(start_block, min(end_block, len(blocks))):
+        block = blocks[i]
+        _lora_attn(block.attn1, rank, alpha)
+        if block.attn2 is not None:
+            _lora_attn(block.attn2, rank, alpha)
+        _lora_ff(block.ff, rank, alpha)
+
+    for p in triposr_model.post_processor.parameters():
+        p.requires_grad_(True)
+
+    return [p for p in triposr_model.parameters() if p.requires_grad]
 
 
 # ─── Mesh helpers ─────────────────────────────────────────────────────────────
@@ -751,7 +819,8 @@ def run_precompute(args: argparse.Namespace) -> None:
 
         _done = [
             all((samples_dir / f"{uid}_az{int(az):03d}_el{int(el):03d}" / fn).exists()
-                for fn in ("triplane.pt", "query_pts.pt", "sdf_gt.pt", "camera_extrinsics.json"))
+                for fn in ("triplane.pt", "query_pts.pt", "sdf_gt.pt",
+                           "camera_extrinsics.json", "input_image.png"))
             for az, el in view_pairs
         ]
         if all(_done):
@@ -810,9 +879,8 @@ def run_precompute(args: argparse.Namespace) -> None:
                 tmp_dir = sample_dir.parent / f"_tmp_{sample_id}"
                 tmp_dir.mkdir(parents=True, exist_ok=True)
 
-                # 1. Render to a temporary PNG and re-load as RGB array so the
-                #    bytes are identical to what run.py / render_to_triposr.py produce.
-                tmp_png = tmp_dir / "_render_tmp.png"
+                # 1. Render to input_image.png (kept on disk for LoRA training).
+                img_path = tmp_dir / "input_image.png"
                 pil_image = render_mesh_to_image(
                     mesh,
                     elevation=float(el),
@@ -821,9 +889,8 @@ def run_precompute(args: argparse.Namespace) -> None:
                     azimuth=float(az),
                     extrinsics_json_path=tmp_dir / "camera_extrinsics.json",
                 )
-                pil_image.save(tmp_png)
-                image_np = np.array(Image.open(tmp_png).convert("RGB"))
-                tmp_png.unlink()  # not stored — only needed for TripoSR input
+                pil_image.save(img_path)
+                image_np = np.array(Image.open(img_path).convert("RGB"))
                 del pil_image
 
                 # 2. Run TripoSR to get the triplane (scene_codes).
@@ -1041,7 +1108,7 @@ class SDFLazyDataset(Dataset):
     Each __getitem__ returns:
         pts_mesh : (N_POINTS, 3)          — query pts in normalized mesh frame
         sdf      : (N_POINTS,)            — GT SDF for uniform pts
-        triplane : (3, Cp, Hp, Wp)        — raw triplane (queried on GPU in training loop)
+        img      : (H, W, 3) uint8 array  — input image; TripoSR runs inline in training
         R        : (3, 3)                 — rotation mesh→triplane frame
         uid      : str                    — object UID (for loading mesh / BVH cache)
     """
@@ -1069,20 +1136,25 @@ class SDFLazyDataset(Dataset):
             load_R_world_from_recon_json_strict(d) for d in self.sample_dirs
         ]
 
+        missing = [d for d in self.sample_dirs if not (d / "input_image.png").exists()]
+        if missing:
+            raise RuntimeError(
+                f"{len(missing)} sample(s) are missing input_image.png "
+                f"(e.g. {missing[0].name}). Re-run precompute to regenerate."
+            )
+
     def __len__(self) -> int:
         return len(self.sample_dirs)
 
     def __getitem__(self, idx: int):
         p = self.sample_dirs[idx]
         R = torch.from_numpy(self.R_list[idx]).float()
-        triplane = torch.load(p / "triplane.pt", map_location="cpu",
-                              weights_only=False).float()
         pts = torch.load(p / "query_pts.pt", map_location="cpu",
                          weights_only=False).clamp(-self.radius, self.radius)
         sdf = torch.load(p / "sdf_gt.pt", map_location="cpu", weights_only=False)
         uid = p.name.split("_az")[0]
-        # Feature computation happens in the training loop on GPU, not here.
-        return pts, sdf, triplane, R, uid
+        img = np.array(Image.open(p / "input_image.png").convert("RGB"))
+        return pts, sdf, img, R, uid
 
 
 # ─── Visualization helpers ────────────────────────────────────────────────────
@@ -1361,16 +1433,19 @@ def visualize_reconstructions(
     density_bias: float = -1.0,
     nerf_threshold: float = 25.0,
     use_triplane_features: bool = True,
+    triposr_model=None,  # required
 ) -> None:
     sdf_mlp.eval()
+    triposr_model.eval()
 
     for label, sample_dirs in (("seen", seen_dirs), ("unseen", unseen_dirs)):
         for sample_dir in sample_dirs:
             uid = sample_dir.name.split("_az")[0]
             try:
-                triplane = torch.load(
-                    sample_dir / "triplane.pt", map_location="cpu", weights_only=False
-                ).float()
+                img_np = np.array(Image.open(sample_dir / "input_image.png").convert("RGB"))
+                with torch.no_grad():
+                    sc = triposr_model([img_np], device=device)
+                triplane = sc[0].detach().float().cpu()
 
                 R_np = load_R_world_from_recon_json_strict(sample_dir)
                 pred_mesh = reconstruct_mesh_from_triplane(
@@ -1639,28 +1714,60 @@ def run_train(args: argparse.Namespace) -> None:
             print(f"Test dataset: {len(test_dataset)} samples  "
                   f"({len(test_uids)} unseen UIDs + {len(test_view_names)} unseen views)")
 
-    # ── Optionally load frozen TripoSR decoder for NeRF sanity-check mesh ────
-    # Only rank 0 runs visualization, so other ranks skip the decoder entirely.
+    # ── LoRA: load full TripoSR, inject adapters, build lora_optimizer ────────
+    from tsr.system import TSR
+    if is_main:
+        print("Loading TripoSR for LoRA fine-tuning...")
+    triposr_model = TSR.from_pretrained(
+        args.model, config_name="config.yaml", weight_name="model.ckpt"
+    )
+    # Inject LoRA BEFORE moving to device so the freshly-created lora_A/lora_B
+    # Parameters get moved to the GPU too (.to() is in-place on Parameters, so
+    # the returned references stay valid and now point at GPU tensors).
+    lora_trainable_params = apply_lora_to_triposr(
+        triposr_model,
+        args.lora_block_start, args.lora_block_end,
+        args.lora_rank, args.lora_alpha,
+    )
+    triposr_model.to(device)
+    # All ranks must start from IDENTICAL LoRA weights. lora_A is randomly
+    # initialised independently per process, so without this each rank would
+    # train a different adapter even though grads are all-reduced every step
+    # (matching grad updates from mismatched starting points still diverge).
+    # Broadcast rank 0's trainable weights to everyone. (sdf_mlp gets this for
+    # free from its DDP wrapper; this model is grad-synced manually instead.)
+    if is_ddp:
+        for p in lora_trainable_params:
+            dist.broadcast(p.data, src=0)
+    lora_optimizer = torch.optim.AdamW(
+        lora_trainable_params,
+        lr=args.lora_lr,
+        weight_decay=args.lora_weight_decay,
+    )
+    _density_activation = triposr_model.renderer.cfg.density_activation
+    _density_bias = float(triposr_model.renderer.cfg.density_bias)
+    n_lora = sum(p.numel() for p in lora_trainable_params)
+    n_total = sum(p.numel() for p in triposr_model.parameters())
+    if is_main:
+        print(f"LoRA ready: {n_lora:,} trainable / {n_total:,} total TripoSR params "
+              f"(backbone blocks {args.lora_block_start}-{args.lora_block_end - 1} "
+              f"+ post_processor) | rank={args.lora_rank} alpha={args.lora_alpha}")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # ── Optionally expose frozen TripoSR decoder for NeRF sanity-check mesh ──
+    # Reuse the already-loaded model; decoder weights are still frozen.
     triposr_decoder: nn.Module | None = None
-    _density_activation = "exp"
-    _density_bias = -1.0
     if is_main and args.use_nerf_vis:
         try:
-            from tsr.system import TSR
-            _full = TSR.from_pretrained(args.model, config_name="config.yaml", weight_name="model.ckpt")
-            triposr_decoder = _full.decoder.to(device).eval()
+            triposr_decoder = triposr_model.decoder.eval()
             for p in triposr_decoder.parameters():
                 p.requires_grad_(False)
-            _density_activation = _full.renderer.cfg.density_activation
-            _density_bias = float(_full.renderer.cfg.density_bias)
-            del _full
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            print(f"TripoSR decoder loaded (density_activation={_density_activation}, bias={_density_bias})")
+            print(f"TripoSR decoder ready (density_activation={_density_activation}, bias={_density_bias})")
         except Exception as e:
-            print(f"Warning: could not load TripoSR decoder ({e}). NeRF vis disabled.")
+            print(f"Warning: could not attach TripoSR decoder ({e}). NeRF vis disabled.")
     elif is_main:
-        print("[nerf_vis] Skipped TripoSR decoder load (USE_NERF_VIS=False).")
+        print("[nerf_vis] Skipped (USE_NERF_VIS=False).")
 
     if is_main:
         print(f"Dataset: {len(dataset)} samples ({len(dataset) * n_pts_per_sample:,} points) | "
@@ -1752,6 +1859,10 @@ def run_train(args: argparse.Namespace) -> None:
         optimizer.load_state_dict(ckpt["optimizer"])
         if "scheduler" in ckpt:
             scheduler.load_state_dict(ckpt["scheduler"])
+        if "lora_model" in ckpt:
+            triposr_model.load_state_dict(ckpt["lora_model"], strict=False)
+        if "lora_optimizer" in ckpt:
+            lora_optimizer.load_state_dict(ckpt["lora_optimizer"])
         start_epoch = ckpt.get("epoch", 0)
         if is_main:
             print(f"Resumed from {args.resume} at epoch {start_epoch}")
@@ -1831,19 +1942,26 @@ def run_train(args: argparse.Namespace) -> None:
         if pbar is not None:
             pbar.set_description(f"Epoch {epoch + 1}/{args.epochs}")
 
-        for sample_pts, sample_sdf, sample_triplane, sample_R, sample_uids in loader:
-            # sample_pts:      (S, N, 3)           — uniform pts in mesh frame, CPU
-            # sample_sdf:      (S, N)              — GT SDF for uniform pts, CPU
-            # sample_triplane: (S, 3, Cp, Hp, Wp)  — raw triplane per sample, CPU
-            # sample_R:        (S, 3, 3)           — rotation matrix per sample, CPU
-            # sample_uids:     list[str]            — UID per sample
+        for sample_pts, sample_sdf, sample_imgs, sample_R, sample_uids in loader:
+            # sample_pts:   (S, N, 3)       — uniform pts in mesh frame, CPU
+            # sample_sdf:   (S, N)          — GT SDF, CPU
+            # sample_imgs:  (S, H, W, 3)    — uint8 images; TripoSR runs inline
+            # sample_R:     (S, 3, 3)       — rotation matrix per sample, CPU
+            # sample_uids:  list[str]       — UID per sample
             S, N = sample_sdf.shape
-
-            # Keep the S small triplanes + rotations resident on GPU for this
-            # outer step. Features are computed per mini-batch from these (see
-            # _compute_features) so we never materialize all N_POINTS features.
-            triplanes_gpu = [sample_triplane[s].to(device) for s in range(S)]
             R_gpu = sample_R.to(device)  # (S, 3, 3)
+
+            # Run TripoSR with LoRA adapters to produce triplanes.
+            # Earlier frozen layers (DINO, backbone blocks 0-9) produce no
+            # grad_fn since their params have requires_grad=False, so PyTorch
+            # only retains the computation graph for LoRA blocks 10-15 and
+            # the post_processor — a modest memory footprint.
+            triposr_model.train()
+            triplanes_gpu = []
+            for s in range(S):
+                img_np = sample_imgs[s].numpy()  # (H, W, 3) uint8
+                scene_codes = triposr_model([img_np], device=device)
+                triplanes_gpu.append(scene_codes[0])  # [3, 40, 64, 64]
 
             # Point pool, all in mesh frame on CPU. Features are NEVER stored
             # here — only raw 3-float points, scalar SDF, and a sample-id tag.
@@ -1852,14 +1970,16 @@ def run_train(args: argparse.Namespace) -> None:
             pool_sid = torch.arange(S).repeat_interleave(N)     # (S*N,)
 
             # ── Pass 1: probe uniform pts in chunks → near-surface mask ───────
-            # Forward-only, no gradient. Features computed per chunk on GPU.
+            # Forward-only, no gradient. Use detached triplanes so we don't
+            # build or retain any LoRA computation graph here.
+            triplanes_probe = [t.detach() for t in triplanes_gpu]
             near_mask = torch.zeros(S * N, dtype=torch.bool)
             with torch.no_grad():
                 for start in range(0, S * N, args.batch_size):
                     end = min(start + args.batch_size, S * N)
                     pm  = pool_pts[start:end].to(device)
                     sg  = pool_sid[start:end].to(device)
-                    feats, pts_trip = _compute_features(pm, sg, triplanes_gpu, R_gpu)
+                    feats, pts_trip = _compute_features(pm, sg, triplanes_probe, R_gpu)
                     if n_freqs > 0:
                         if args.use_triplane_features:
                             p1_in = torch.cat([feats, fourier_encode(pts_trip, n_freqs)], dim=-1)
@@ -1932,6 +2052,11 @@ def run_train(args: argparse.Namespace) -> None:
             pool_sdf = pool_sdf[perm]
             pool_sid = pool_sid[perm]
 
+            # LoRA grads accumulate across ALL mini-batches in this outer step,
+            # then the lora_optimizer steps once at the end.  Zero them here so
+            # the accumulation starts clean for this outer step.
+            lora_optimizer.zero_grad()
+
             # CRITICAL for DDP: every rank must run the SAME number of backward
             # / gradient all-reduce calls. The pool size varies per rank (each
             # adds a different number of near-surface points), so we iterate a
@@ -1946,11 +2071,13 @@ def run_train(args: argparse.Namespace) -> None:
                 pm     = pool_pts[start:end].to(device)
                 sg     = pool_sid[start:end].to(device)
                 sdf_gt = pool_sdf[start:end].to(device)
+                is_last_mb = (mb == steps_per_outer - 1)
 
-                # Features are detached (constant); gradient flows only through
-                # the positional encoding of query_pts (matches prior semantics).
-                with torch.no_grad():
-                    base_feats, pts_trip = _compute_features(pm, sg, triplanes_gpu, R_gpu)
+                # Gradient flows from sdf_pred through base_feats → triplane
+                # → LoRA adapters.  pts_trip is detached before being used
+                # as query_pts so the eikonal ∂sdf/∂query_pts graph is
+                # independent of the LoRA graph.
+                base_feats, pts_trip = _compute_features(pm, sg, triplanes_gpu, R_gpu)
                 query_pts = pts_trip.detach().requires_grad_(True)
 
                 if n_freqs > 0:
@@ -2002,7 +2129,13 @@ def run_train(args: argparse.Namespace) -> None:
                         + args.sign_bce_weight * bce_loss)
 
                 optimizer.zero_grad()
-                loss.backward()
+                # Retain the TripoSR computation graph across all mini-batches
+                # so accumulated LoRA grads are correct; the final mini-batch
+                # frees the graph as usual.
+                if not is_last_mb:
+                    loss.backward(retain_graph=True)
+                else:
+                    loss.backward()
                 # clip_grad_norm_ returns the TOTAL norm BEFORE clipping — log it
                 # to see whether clipping is actually engaging.
                 preclip_norm = float(
@@ -2057,8 +2190,18 @@ def run_train(args: argparse.Namespace) -> None:
                     except Exception:
                         pass
 
+            # ── LoRA optimizer step (once per outer step, after all mini-batches) ──
+            if is_ddp:
+                # Manually sync accumulated LoRA grads across ranks before stepping.
+                for p in lora_trainable_params:
+                    if p.grad is not None:
+                        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                        p.grad.div_(world_size)
+            torch.nn.utils.clip_grad_norm_(lora_trainable_params, args.grad_clip)
+            lora_optimizer.step()
+
             # Free GPU-resident triplanes before the next outer step
-            del triplanes_gpu, R_gpu
+            del triplanes_gpu, triplanes_probe, R_gpu
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -2108,13 +2251,17 @@ def run_train(args: argparse.Namespace) -> None:
         # ── Test evaluation (rank 0 only) ─────────────────────────────────────
         if is_main and test_loader is not None:
             _mlp_module.eval()
+            triposr_model.eval()
             test_weighted_sum = test_mse_sum = test_sign_acc_sum = 0.0
             test_steps = 0
             with torch.no_grad():
-                for t_pts, t_sdf, t_triplane, t_R, _ in test_loader:
+                for t_pts, t_sdf, t_imgs, t_R, _ in test_loader:
                     tS, tN = t_sdf.shape
-                    t_trip_gpu = [t_triplane[s].to(device) for s in range(tS)]
-                    t_R_gpu    = t_R.to(device)
+                    t_R_gpu = t_R.to(device)
+                    t_trip_gpu = []
+                    for s in range(tS):
+                        sc = triposr_model([t_imgs[s].numpy()], device=device)
+                        t_trip_gpu.append(sc[0])
                     t_pool_pts = t_pts.reshape(tS * tN, 3)
                     t_pool_sdf = t_sdf.reshape(tS * tN)
                     t_pool_sid = torch.arange(tS).repeat_interleave(tN)
@@ -2163,14 +2310,17 @@ def run_train(args: argparse.Namespace) -> None:
         if is_main and (is_last or (epoch + 1) % args.save_every == 0):
             ckpt_path = output_dir / f"sdf_head_{RUN_NAME}_epoch{epoch + 1:04d}.pt"
             ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save({
+            ckpt_dict = {
                 "epoch": epoch + 1,
                 "model": _mlp_module.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "meta": meta,
                 "args": vars(args),
-            }, ckpt_path)
+            }
+            ckpt_dict["lora_model"] = triposr_model.state_dict()
+            ckpt_dict["lora_optimizer"] = lora_optimizer.state_dict()
+            torch.save(ckpt_dict, ckpt_path)
 
         if is_main and args.vis_every > 0 and (epoch + 1) % args.vis_every == 0:
             visualize_reconstructions(
@@ -2192,6 +2342,7 @@ def run_train(args: argparse.Namespace) -> None:
                 density_activation=_density_activation,
                 density_bias=_density_bias,
                 use_triplane_features=args.use_triplane_features,
+                triposr_model=triposr_model,
             )
 
     if pbar is not None:
@@ -2271,6 +2422,12 @@ def main() -> None:
         samples_per_batch = SAMPLES_PER_BATCH,
         resume         = RESUME,
         use_nerf_vis   = USE_NERF_VIS,
+        lora_rank           = LORA_RANK,
+        lora_alpha          = LORA_ALPHA,
+        lora_block_start    = LORA_BLOCK_START,
+        lora_block_end      = LORA_BLOCK_END,
+        lora_lr             = LORA_LR,
+        lora_weight_decay   = LORA_WEIGHT_DECAY,
     )
 
     if command == "precompute":
