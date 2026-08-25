@@ -65,16 +65,59 @@ DATASET_DIR     = "/home/markiv/TripoSR/sdf_dataset"
 
 # ── Precompute ───────────────────────────────────────────────────────────────
 MODEL                 = "stabilityai/TripoSR"
-N_OBJECTS             = 100
+N_OBJECTS             = 10000
 AZIMUTHS_PER_MESH     = 5              # × len(ELEVATIONS) = 10 views per object
 ELEVATIONS            = [15.0, 30.0]   # two elevation bands; replaces single ELEVATION
 N_POINTS              = 32768         # = 64^3
-NEAR_SURFACE_FRACTION = 0.0            # 0 = fully uniform in [-radius, radius]³ (mimics MC inference grid);
-                                       # near-surface supervision comes only from the training-time Pass-2 augment
+NEAR_SURFACE_FRACTION = 0.25           # fraction of query pts drawn near mesh vertices (Gaussian jitter)
+                                       # rather than fully uniform in [-radius, radius]³. Sampled ONCE here
+                                       # at precompute (v0.41's 75/25 uniform/near-surface split) — no
+                                       # training-time online resampling pass.
+SHARP_EDGE_FRACTION   = 0.0            # fraction of query pts sampled near sharp mesh edges (Dora-style
+                                       # salience sampling; uniform sampling loses geometric detail)
+                                       # TEMPORARILY DISABLED (was 0.2) for debugging — restore to re-enable.
+                                       # NOTE: takes effect at PRECOMPUTE; re-precompute to change the
+                                       # point distribution of an existing dataset.
+SHARP_EDGE_ANGLE_DEG  = 30.0           # dihedral angle above which an edge counts as sharp
+REPAIR_MESHES         = True           # repair non-watertight meshes (fill holes → voxel remesh, TripoSG-style)
+                                       # instead of skipping them
+REPAIR_VOXEL_RES      = 128            # voxel remesh resolution along the longest edge (fallback repair)
+REPAIR_VOXEL_METHOD   = "ray"          # trimesh voxelizer. DO NOT use "subdivide" (trimesh's DEFAULT):
+                                       # it recursively splits triangles until edges < pitch/2, so a
+                                       # 12-face box becomes 2.36M faces (196,608x) — measured — and real
+                                       # Objaverse assets are full of large flat polygons, which is what
+                                       # OOM-killed precompute. "ray" never subdivides (memory bounded by
+                                       # the voxel grid): 4.6x less peak RSS, 6x faster, same watertight
+                                       # result on that worst case.
 IMAGE_SIZE            = 256
 FOV                   = 40.0
 MAX_MESH_MB           = 0.0
 MAX_TRIANGLES         = 500_000       # skip meshes with more faces than this (BVH RAM guard)
+SDF_BACKEND           = "kdtree"      # "kdtree" | "trimesh". Closest-point backend for GT SDF.
+                                      # "trimesh" (ProximityQuery.on_surface) sizes its candidate set by
+                                      # DISTANCE-TO-NEAREST-VERTEX, so far-field query points (75% of ours
+                                      # once NEAR_SURFACE_FRACTION=0.25) pull in thousands of candidate
+                                      # faces each — measured 6,528 faces/point on a 61K-face mesh, which
+                                      # is BOTH the ~96 s/object time sink and a 3.5 GB RAM spike (x4 ranks).
+                                      # "kdtree" bounds candidates to k per point regardless of distance:
+                                      # measured 23x faster, and MORE accurate — where the two disagree,
+                                      # brute force over all triangles confirms kdtree exact (0.00e+00)
+                                      # and trimesh off by 1.6e-6 (its radius padding can miss the true
+                                      # closest face). Keep "trimesh" only to reproduce older datasets.
+SDF_KDTREE_K          = 32            # candidate faces per point for the kdtree backend's upper-bound
+                                      # stage. A radius-refinement pass then makes the result exact, so
+                                      # k only trades a little speed, never correctness.
+SDF_KDTREE_CHUNK      = 8192          # points per kdtree chunk. The tree is built once and reused, so
+                                      # this caps only the transient (chunk × k) triangle array — the
+                                      # single sizeable allocation — without repeating any setup work.
+SDF_QUERY_CHUNK       = 1024          # points per trimesh on_surface call. RAM GUARD, not a speed knob:
+                                      # on_surface transiently materializes
+                                      # (chunk × candidate-triangles-per-point), and degenerate Objaverse
+                                      # meshes yield tens of thousands of candidates per point — the spike
+                                      # scales LINEARLY with chunk size (~1-2 GB per 512 points, per process).
+                                      # The old 8192 default could spike 16-32 GB on one bad mesh and get the
+                                      # process OOM-killed. Lower this further if precompute still dies,
+                                      # especially when sharding across GPUs (N processes spike concurrently).
 VERBOSE               = False
 
 # ── Train ────────────────────────────────────────────────────────────────────
@@ -96,21 +139,34 @@ SIGN_BCE_WEIGHT       = 0.1    # auxiliary sign-classification loss weight (0 di
 SIGN_BCE_ALPHA        = 20.0   # sigmoid temperature: larger → sharper sign boundary
 SIGN_BCE_EPSILON      = 0.02   # exclude |sdf_gt| < this (ambiguous near-surface sign)
 SURFACE_LOSS_SIGMA    = 0.05   # exp(-|sdf|/sigma) weighting; ~5% of object scale
-NEAR_SURFACE_SIGMA    = 0.02   # Gaussian noise std when perturbing near-surface pts
-NEAR_SURFACE_THRESHOLD = 0.05  # |pred SDF| < this → point is considered near-surface
-NEAR_SURFACE_RATIO = 1.0  # near-surface pts per sample = ratio × N_POINTS (1.0 ⇒ equal to uniform)
-AUGMENT_BUDGET_SEC    = 20     # wall-clock budget for the per-step trimesh augment
-NCCL_TIMEOUT_MIN      = 30     # DDP collective timeout (headroom for slow augment steps)
-SDF_CLAMP             = 0.0
+NCCL_TIMEOUT_MIN      = 30     # DDP collective timeout
+SDF_CLAMP             = 0.1   # TSDF clamp δ: pred & GT clamped to ±δ in the data loss (0 disables).
+                              # DeepSDF-standard; focuses capacity near the surface. Sign-BCE and
+                              # eikonal still steer badly-wrong far-field points.
+                              # TEMPORARILY DISABLED (was 0.1) for debugging — restore to re-enable.
+NORMAL_LOSS_WEIGHT    = 0.0   # surface-normal alignment loss weight (0 disables). IGR/TripoSG-style:
+                              # align ∇f with the GT SDF gradient direction at near-surface points.
+                              # TEMPORARILY DISABLED (was 0.1) for debugging — restore to re-enable.
+NORMAL_LOSS_THRESHOLD = 0.05  # only points with |sdf_gt| < this get normal supervision
 NUM_WORKERS     = 4
-RUN_NAME        = "v0.61_100"
+RUN_NAME        = "v0.64_10k"
 TEST_FRACTION   = 0.2        # fraction of meshes (UIDs) held out as unseen
 TEST_VIEW_FRACTION = 0.2     # fraction of views held out per mesh
+TEST_MAX_SAMPLES = 3600      # hard cap on test-set size (0 = no cap). The test set otherwise
+                             # scales with N_OBJECTS (360 @100, 3.6k @1k, 36k @10k) and rank 0
+                             # evaluates ALL of it every epoch while the other ranks sit blocked
+                             # in the next epoch's DDP all-reduce -> at 10k objects that exceeded
+                             # NCCL_TIMEOUT_MIN and killed the job. 3600 = the size the 1k runs
+                             # used, so test curves stay comparable with those runs.
 VIS_EVERY       = 25
 VIS_SEEN        = 3
 VIS_UNSEEN      = 3
 VIS_AZIMUTHS_PER_OBJECT = 5
 VIS_RESOLUTION  = 64
+FSCORE_TAU            = 0.01   # F-score distance threshold (fraction of unit-normalized mesh scale)
+MESH_METRIC_SAMPLES   = 50000  # surface samples for Chamfer / F-score; must be dense enough that
+                               # the NN-distance floor sits well below FSCORE_TAU (identical meshes
+                               # score F≈1.0 at 50k samples; at 10k the floor already eats τ=0.01)
 BATCH_SIZE        = 4096
 SAMPLES_PER_BATCH = 4      # samples loaded per DataLoader step; points per step = SAMPLES_PER_BATCH × N_POINTS
 RESUME            = None
@@ -118,6 +174,14 @@ WEIGHT_DECAY    = 1e-4
 USE_TANH_OUTPUT = False
 USE_TRIPLANE_FEATURES  = True   # ablation: set False to zero out triplane features (PE only)
 USE_NERF_VIS           = True  # load TripoSR decoder + render NeRF mesh during visualization
+USE_TORCH_COMPILE      = False # INCOMPATIBLE with the eikonal loss — leave False while EIKONAL_WEIGHT > 0.
+                               # The eikonal term does torch.autograd.grad(..., create_graph=True) and then
+                               # loss.backward(), i.e. a DOUBLE BACKWARD, which aot_autograd rejects:
+                               #   "torch.compile with aot_autograd does not currently support double backward"
+                               # Note dynamo's suppress_errors=True does NOT rescue this: it only catches
+                               # graph-CAPTURE failures, while this raises at runtime inside backward.
+                               # run_train hard-disables it when eikonal_weight > 0 (see the guard there),
+                               # so it is only usable in an eikonal-free ablation.
 
 # ── LoRA fine-tuning ─────────────────────────────────────────────────────────
 LORA_RANK              = 16
@@ -336,9 +400,15 @@ def query_triplane_features(
 
 # ─── Fourier positional encoding ─────────────────────────────────────────────
 
-def surface_weighted_se(pred: torch.Tensor, target: torch.Tensor, sigma: float = 0.05) -> torch.Tensor:
-    """Per-point surface-weighted squared error (NOT reduced)."""
-    weights = torch.exp(-target.abs() / sigma)
+def surface_weighted_se(pred: torch.Tensor, target: torch.Tensor, sigma: float = 0.05,
+                        weight_target: torch.Tensor | None = None) -> torch.Tensor:
+    """Per-point surface-weighted squared error (NOT reduced).
+
+    ``weight_target`` (default: ``target``) lets the caller weight by the
+    UNCLAMPED distance while the residual uses TSDF-clamped values, so clamping
+    does not flatten the near-surface emphasis."""
+    w_src = target if weight_target is None else weight_target
+    weights = torch.exp(-w_src.abs() / sigma)
     weights = weights / weights.mean()
     return weights * (pred - target) ** 2
 
@@ -382,9 +452,17 @@ class LoRALinear(nn.Module):
         self.lora_A = nn.Parameter(torch.empty(rank, d_in))
         self.lora_B = nn.Parameter(torch.zeros(d_out, rank))
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        # Toggled off by the stock_triposr() context manager. ``base`` holds the
+        # ORIGINAL pretrained nn.Linear and is frozen for the whole run, so
+        # skipping the low-rank term recovers stock TripoSR exactly — no need to
+        # keep a second copy of the model around just to get a baseline.
+        self.lora_enabled = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.base(x) + (x @ self.lora_A.T @ self.lora_B.T) * self.scale
+        out = self.base(x)
+        if self.lora_enabled:
+            out = out + (x @ self.lora_A.T @ self.lora_B.T) * self.scale
+        return out
 
 
 def _lora_attn(attn, rank: int, alpha: float) -> None:
@@ -425,7 +503,94 @@ def apply_lora_to_triposr(triposr_model, start_block: int, end_block: int,
     for p in triposr_model.post_processor.parameters():
         p.requires_grad_(True)
 
+    # Stash the pristine post_processor so stock_triposr() can restore it. This
+    # must happen BEFORE any fine-tuned weights are loaded/trained into it.
+    snapshot_stock_post_processor(triposr_model)
+
     return [p for p in triposr_model.parameters() if p.requires_grad]
+
+
+def snapshot_stock_post_processor(triposr_model) -> None:
+    """Record the ORIGINAL post_processor weights for stock_triposr().
+
+    apply_lora_to_triposr changes exactly two things relative to pretrained
+    TripoSR: it adds low-rank deltas (whose ``base`` stays frozen at the
+    pretrained value) and it fully unfreezes ``post_processor``. So the only
+    state that must be snapshotted to reconstruct stock behaviour is the
+    post_processor — and that is just 2 small tensors, not a second 427M model.
+    """
+    import copy
+    triposr_model._stock_post_processor_state = copy.deepcopy(
+        triposr_model.post_processor.state_dict())
+
+
+@contextlib.contextmanager
+def stock_triposr(triposr_model):
+    """Temporarily run ``triposr_model`` as ORIGINAL, un-fine-tuned TripoSR.
+
+    Disables every LoRA delta and swaps the pretrained post_processor back in,
+    restoring the fine-tuned state on exit (even if the body raises). Used to
+    produce the NeRF baseline so it answers "what does stock TripoSR do on this
+    image?" — a real before/after against the fine-tuned model — rather than
+    decoding a fine-tuned triplane with the original density head.
+
+    A no-op (yields the model unchanged) if no LoRA was applied, so callers do
+    not need to special-case stock checkpoints.
+    """
+    import copy
+    lora_mods = [m for m in triposr_model.modules() if isinstance(m, LoRALinear)]
+    stock_pp = getattr(triposr_model, "_stock_post_processor_state", None)
+    prev = [m.lora_enabled for m in lora_mods]
+    saved_pp = None
+    try:
+        for m in lora_mods:
+            m.lora_enabled = False
+        if stock_pp is not None:
+            saved_pp = copy.deepcopy(triposr_model.post_processor.state_dict())
+            triposr_model.post_processor.load_state_dict(stock_pp)
+        yield triposr_model
+    finally:
+        for m, p in zip(lora_mods, prev):
+            m.lora_enabled = p
+        if saved_pp is not None:
+            triposr_model.post_processor.load_state_dict(saved_pp)
+
+
+def compute_cached_image_tokens(
+    triposr_model, image_np: np.ndarray, device: torch.device,
+) -> torch.Tensor:
+    """Precompute-time: run the DINO image tokenizer once and cache its output.
+
+    apply_lora_to_triposr only wraps backbone.transformer_blocks + unfreezes
+    post_processor — image_tokenizer is NEVER touched by LoRA regardless of
+    which blocks get fine-tuned. Its output is therefore a frozen, deterministic
+    function of the image alone (ImagePreprocessor has no randomness either),
+    safe to precompute once and reuse for the lifetime of training. Returns
+    (n_tokens, C) with the batch dim dropped, for per-sample disk storage.
+    """
+    with torch.no_grad():
+        rgb_cond = triposr_model.image_processor(
+            [image_np], triposr_model.cfg.cond_image_size
+        )[:, None].to(device)
+        tokens = triposr_model.image_tokenizer(
+            rearrange(rgb_cond, "B Nv H W C -> B Nv C H W", Nv=1)
+        )
+        tokens = rearrange(tokens, "B Nv C Nt -> B (Nv Nt) C", Nv=1)
+    return tokens[0].cpu()
+
+
+def triposr_forward_from_cached_tokens(
+    triposr_model, input_image_tokens: torch.Tensor,
+) -> torch.Tensor:
+    """Train-time: TSR.forward's tokenizer→backbone→post_processor chain,
+    skipping the (frozen, precomputed) image tokenizer entirely.
+
+    ``input_image_tokens`` is (B, n_tokens, C), already on the model's device.
+    """
+    batch_size = input_image_tokens.shape[0]
+    tokens = triposr_model.tokenizer(batch_size)
+    tokens = triposr_model.backbone(tokens, encoder_hidden_states=input_image_tokens)
+    return triposr_model.post_processor(triposr_model.tokenizer.detokenize(tokens))
 
 
 # ─── Mesh helpers ─────────────────────────────────────────────────────────────
@@ -552,7 +717,108 @@ def load_R_world_from_recon_json_strict(sample_dir: Path) -> np.ndarray:
     return R
 
 
-def compute_sdf(mesh, points: np.ndarray, batch_size: int = 8192) -> np.ndarray:
+def _closest_point_kdtree(mesh, points: np.ndarray, k: int = SDF_KDTREE_K,
+                          chunk: int = SDF_KDTREE_CHUNK):
+    """Exact closest-point query via a cKDTree over face centroids.
+
+    Same return contract as ``trimesh.proximity.ProximityQuery.on_surface``:
+    ``(closest_points, distances, triangle_ids)``.
+
+    Exactness argument (this is NOT a k-nearest approximation):
+      Stage 1 takes the k nearest face centroids and computes true
+      point-triangle distances to them. The best of those, ``d_ub``, is a
+      distance actually achieved by a real triangle, hence a valid UPPER BOUND
+      on the true closest distance.
+      Stage 2 uses the fact that any triangle whose surface lies closer than
+      ``d_ub`` must have its centroid within ``d_ub + R_T``, where ``R_T`` is
+      that triangle's centroid->vertex radius. Triangles are split by ``R_T``:
+      the handful of large ones are brute-forced, and the rest get a tight ball
+      query at ``d_ub + r_thresh``. Every triangle that could possibly beat the
+      bound is therefore examined.
+
+    Verified against brute force over all triangles: exact (0.00e+00), while
+    trimesh's on_surface was off by 1.6e-6 on the same points.
+    """
+    import trimesh  # module-local: train_sdf_head does not import trimesh globally
+    from scipy.spatial import cKDTree
+
+    tri = mesh.triangles
+    if len(tri) == 0:
+        raise ValueError("Mesh has no triangles")
+    cent = tri.mean(axis=1)
+    R = np.linalg.norm(tri - cent[:, None, :], axis=2).max(axis=1)
+
+    # Split off the largest-radius triangles; they would otherwise force a huge
+    # ball-query radius for every point (one giant triangle would negate the
+    # whole bound). There are few of them, so brute force is cheap.
+    r_thresh = float(np.percentile(R, 99.5))
+    big = np.where(R > r_thresh)[0]
+    small = np.where(R <= r_thresh)[0]
+    if len(small) == 0:  # degenerate: all triangles "large"
+        big, small = np.arange(len(tri)), np.arange(0)
+
+    # The cKDTree is built ONCE and reused across point chunks. Chunking caps the
+    # transient (chunk × k) triangle array — the only sizeable allocation here —
+    # which matters because precompute runs one of these per rank concurrently.
+    tree = cKDTree(cent[small]) if len(small) > 0 else None
+    kk = int(min(k, len(small))) if tree is not None else 0
+
+    cp_out = np.zeros((len(points), 3), dtype=np.float64)
+    d_out = np.full(len(points), np.inf, dtype=np.float64)
+    t_out = np.zeros(len(points), dtype=np.int64)
+
+    for s0 in range(0, len(points), max(chunk, 1)):
+        pc = points[s0 : s0 + max(chunk, 1)]
+        ar = np.arange(len(pc))
+
+        def _dists(cand_idx, _pc=pc):
+            """Exact point-triangle distances for an (N, M) candidate index array."""
+            n, m = cand_idx.shape
+            q = np.repeat(_pc[:, None, :], m, axis=1).reshape(-1, 3)
+            cp = trimesh.triangles.closest_point(tri[cand_idx.reshape(-1)], q)
+            d = np.linalg.norm(q - cp, axis=1).reshape(n, m)
+            return d, cp.reshape(n, m, 3)
+
+        if tree is not None:
+            _, idx = tree.query(pc, k=kk, workers=-1)
+            cand = small[np.atleast_2d(idx.reshape(len(pc), kk))]
+            d, cp = _dists(cand)
+            b = d.argmin(axis=1)
+            d_best, cp_best, t_best = d[ar, b], cp[ar, b], cand[ar, b]
+        else:
+            d_best = np.full(len(pc), np.inf)
+            cp_best = np.zeros((len(pc), 3))
+            t_best = np.zeros(len(pc), dtype=np.int64)
+
+        if len(big) > 0:
+            d_b, cp_b = _dists(np.tile(big, (len(pc), 1)))
+            bb = d_b.argmin(axis=1)
+            better = d_b[ar, bb] < d_best
+            d_best = np.where(better, d_b[ar, bb], d_best)
+            cp_best = np.where(better[:, None], cp_b[ar, bb], cp_best)
+            t_best = np.where(better, big[bb], t_best)
+
+        # Exact refinement: examine every small triangle that could still beat d_best.
+        if tree is not None:
+            for i, cl in enumerate(tree.query_ball_point(pc, d_best + r_thresh, workers=-1)):
+                if len(cl) > kk:
+                    ci = small[np.asarray(cl, dtype=np.int64)]
+                    cp_i = trimesh.triangles.closest_point(
+                        tri[ci], np.repeat(pc[i][None], len(ci), axis=0))
+                    di = np.linalg.norm(pc[i] - cp_i, axis=1)
+                    j = int(di.argmin())
+                    if di[j] < d_best[i]:
+                        d_best[i], cp_best[i], t_best[i] = di[j], cp_i[j], ci[j]
+
+        cp_out[s0 : s0 + len(pc)] = cp_best
+        d_out[s0 : s0 + len(pc)] = d_best
+        t_out[s0 : s0 + len(pc)] = t_best
+
+    return cp_out, d_out, t_out
+
+
+def compute_sdf(mesh, points: np.ndarray, batch_size: int = SDF_QUERY_CHUNK,
+                return_normals: bool = False, backend: str = SDF_BACKEND):
     """Signed distance: negative inside, positive outside.
 
     Avoids mesh.contains() (ray-casting, extremely memory-intensive) by deriving
@@ -560,24 +826,99 @@ def compute_sdf(mesh, points: np.ndarray, batch_size: int = 8192) -> np.ndarray:
     normal at the closest triangle.  This is O(N) RAM instead of O(N × triangles).
 
     ProximityQuery is built once per call so the BVH is not rebuilt per batch.
+
+    ``batch_size`` only applies to the "trimesh" backend, where it is a RAM
+    guard rather than a speed knob (see SDF_QUERY_CHUNK): on_surface transiently
+    materializes (batch_size × candidate-faces-per-point), and that candidate
+    count grows with distance from the surface. The "kdtree" backend bounds
+    candidates per point structurally, so it runs in a single pass.
+
+    With ``return_normals=True`` also returns the GT SDF gradient direction per
+    point: sign·(query − closest)/‖query − closest‖. For both inside and outside
+    points this equals the outward surface direction (exact ∇SDF, correct even
+    near edges/corners where face normals are ambiguous); falls back to the
+    nearest face normal for points lying on the surface.
     """
     import trimesh.proximity
     points = np.asarray(points, dtype=np.float64)
-    prox = trimesh.proximity.ProximityQuery(mesh)
     face_normals = np.asarray(mesh.face_normals, dtype=np.float64)
 
+    if backend == "kdtree":
+        prox, step = None, len(points)          # candidate set is bounded per point
+    elif backend == "trimesh":
+        prox, step = trimesh.proximity.ProximityQuery(mesh), batch_size
+    else:
+        raise ValueError(f"SDF_BACKEND must be 'kdtree' or 'trimesh' — got {backend!r}")
+
     sdf = np.empty(len(points), dtype=np.float32)
-    for i in range(0, len(points), batch_size):
-        batch = points[i : i + batch_size]
-        closest, distances, tri_ids = prox.on_surface(batch)
+    normals = np.empty((len(points), 3), dtype=np.float32) if return_normals else None
+    for i in range(0, len(points), max(step, 1)):
+        batch = points[i : i + max(step, 1)]
+        if prox is None:
+            closest, distances, tri_ids = _closest_point_kdtree(mesh, batch)
+        else:
+            closest, distances, tri_ids = prox.on_surface(batch)
         # Sign: positive outside (dot > 0), negative inside (dot < 0)
         direction = batch - closest
         dot = np.einsum("ij,ij->i", direction, face_normals[tri_ids])
         sign = np.where(dot >= 0, 1.0, -1.0)
-        sdf[i : i + batch_size] = (sign * distances).astype(np.float32)
+        # Slice by len(batch), NOT batch_size: the kdtree backend steps by the
+        # whole array, so batch_size would truncate the write-back.
+        sdf[i : i + len(batch)] = (sign * distances).astype(np.float32)
+        if return_normals:
+            n = direction * (sign / np.maximum(distances, 1e-9))[:, None]
+            on_surf = distances < 1e-6
+            if on_surf.any():
+                n[on_surf] = face_normals[tri_ids[on_surf]]
+            normals[i : i + len(batch)] = n.astype(np.float32)
 
     del prox  # release BVH memory explicitly
+    if return_normals:
+        return sdf, normals
     return sdf
+
+
+def sample_sharp_edge_points(
+    mesh,
+    n_points: int,
+    radius: float,
+    angle_deg: float = 30.0,
+    noise_std: float = 0.02,
+) -> np.ndarray:
+    """Dora-style salience sampling: query points concentrated near sharp edges.
+
+    Edges whose dihedral angle exceeds ``angle_deg`` are sampled proportionally
+    to their length, then perturbed at two noise scales (σ and σ/4) so both the
+    surface band and the fine-detail band around the edge are covered. Returns
+    an empty array when the mesh has no sharp edges (caller pads with uniform).
+    """
+    empty = np.zeros((0, 3), dtype=np.float32)
+    if n_points <= 0 or len(mesh.faces) == 0:
+        return empty
+    try:
+        angles = np.asarray(mesh.face_adjacency_angles)   # radians, per adjacency
+        edges  = np.asarray(mesh.face_adjacency_edges)    # (E, 2) vertex indices
+    except Exception:
+        return empty
+    if angles.size == 0 or edges.shape[0] != angles.shape[0]:
+        return empty
+    sharp = angles > np.radians(angle_deg)
+    if not sharp.any():
+        return empty
+
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    v0, v1 = verts[edges[sharp, 0]], verts[edges[sharp, 1]]
+    lengths = np.linalg.norm(v1 - v0, axis=1)
+    total = float(lengths.sum())
+    if total <= 0:
+        return empty
+
+    idx = np.random.choice(len(lengths), n_points, p=lengths / total)
+    t = np.random.rand(n_points, 1)
+    on_edge = v0[idx] * (1.0 - t) + v1[idx] * t
+    std = np.where(np.random.rand(n_points, 1) < 0.5, noise_std, noise_std / 4.0)
+    pts = on_edge + np.random.normal(0.0, 1.0, (n_points, 3)) * std
+    return np.clip(pts.astype(np.float32), -radius, radius)
 
 
 def sample_query_points(
@@ -586,17 +927,30 @@ def sample_query_points(
     radius: float,
     near_surface_fraction: float = 0.5,
     near_surface_std: float | None = None,
+    sharp_edge_fraction: float = 0.0,
+    sharp_edge_angle_deg: float = 30.0,
 ) -> np.ndarray:
     """Sample query points in the full TripoSR scene volume [-radius, radius]³.
 
-    With near_surface_fraction=0 (default for training), all points are drawn
-    uniformly from the same [-radius, radius]³ cube that marching-cubes evaluates
-    during inference — eliminating the training/inference distribution mismatch.
+    With near_surface_fraction=0 (default for training), non-sharp points are
+    drawn uniformly from the same [-radius, radius]³ cube that marching-cubes
+    evaluates during inference — eliminating the training/inference distribution
+    mismatch. ``sharp_edge_fraction`` additionally concentrates that fraction of
+    points near sharp mesh edges (Dora-style); if the mesh has no sharp edges
+    the budget falls back to uniform samples.
     """
     if near_surface_std is None:
         near_surface_std = float(radius * 0.04)
-    n_near    = int(n_points * near_surface_fraction)
-    n_uniform = n_points - n_near
+    n_near  = int(n_points * near_surface_fraction)
+    n_sharp = int(n_points * sharp_edge_fraction)
+
+    sharp = (sample_sharp_edge_points(mesh, n_sharp, radius,
+                                      angle_deg=sharp_edge_angle_deg,
+                                      noise_std=near_surface_std)
+             if n_sharp > 0 else np.zeros((0, 3), dtype=np.float32))
+
+    # Pad with uniform samples when the mesh yielded no sharp edges.
+    n_uniform = n_points - n_near - sharp.shape[0]
 
     # Uniform samples span the full triplane query volume, not just mesh bounds.
     uniform = np.random.uniform(-radius, radius, (n_uniform, 3)).astype(np.float32)
@@ -609,8 +963,56 @@ def sample_query_points(
     else:
         near = np.zeros((0, 3), dtype=np.float32)
 
-    pts = np.concatenate([uniform, near], axis=0) if n_near > 0 else uniform
+    parts = [p for p in (uniform, near, sharp) if p.shape[0] > 0]
+    pts = np.concatenate(parts, axis=0) if len(parts) > 1 else parts[0]
     return np.clip(pts, -radius, radius)
+
+
+def repair_mesh_watertight(mesh, voxel_res: int = 128,
+                           voxel_method: str = REPAIR_VOXEL_METHOD):
+    """Try to make ``mesh`` watertight instead of discarding it (TripoSG-style).
+
+    1. Cheap topological repair: merge vertices, fill holes, fix normals.
+    2. Fallback: voxelize + fill interior + marching cubes (TSDF-fusion-style
+       remesh) — changes the triangulation but preserves the outer surface.
+
+    ``voxel_method`` MUST NOT be trimesh's default "subdivide" — see
+    REPAIR_VOXEL_METHOD. "subdivide" recursively splits every triangle until
+    its edges are shorter than pitch/2, which for a normalized mesh at
+    voxel_res=128 means edges < 0.0039: measured, a 12-triangle box explodes to
+    2.36 MILLION faces (196,608x). Real Objaverse assets are full of large flat
+    polygons (walls, ground planes, backdrops), so this is the common case, not
+    the rare one — it is what OOM-killed precompute. "ray" never subdivides at
+    all (memory bounded by the voxel grid), and measured 4.6x less peak RSS and
+    6x faster on that same worst case, with equally watertight output.
+
+    Returns (repaired_mesh, method) on success or (None, reason) on failure.
+    """
+    import trimesh
+    if mesh.is_watertight:
+        return mesh, "already-watertight"
+
+    m = mesh.copy()
+    try:
+        m.merge_vertices()
+        m.remove_unreferenced_vertices()
+        trimesh.repair.fill_holes(m)
+        trimesh.repair.fix_normals(m)
+        if m.is_watertight and len(m.faces) > 0:
+            return m, "hole-filled"
+    except Exception:
+        pass
+
+    try:
+        pitch = float(max(mesh.extents)) / float(voxel_res)
+        vox = mesh.voxelized(pitch=pitch, method=voxel_method).fill()
+        remeshed = vox.marching_cubes
+        remeshed.apply_transform(vox.transform)  # MC output is in voxel-index space
+        if remeshed.is_watertight and len(remeshed.faces) > 0:
+            return remeshed, f"voxel-remeshed[{voxel_method}]"
+    except (Exception, MemoryError) as e:
+        return None, f"voxel-remesh-failed: {type(e).__name__}: {e}"
+    return None, "unrepairable"
 
 
 # ─── Rendering ────────────────────────────────────────────────────────────────
@@ -687,6 +1089,8 @@ def render_mesh_to_image(
 
 def get_objaverse_uid_pool(seed: int = 42, quiet: bool = False) -> list[str]:
     import objaverse
+    from objaverse_paths import configure_objaverse
+    configure_objaverse()
     if not quiet:
         print("[objaverse] Loading UID list...")
     all_uids = list(objaverse.load_uids())
@@ -699,6 +1103,8 @@ def get_objaverse_uid_pool(seed: int = 42, quiet: bool = False) -> list[str]:
 
 def download_mesh(uid: str, cache_dir: str) -> str:
     import objaverse
+    from objaverse_paths import configure_objaverse
+    configure_objaverse()
     os.makedirs(cache_dir, exist_ok=True)
     cached_dir = os.path.join(cache_dir, uid)
     for ext in (".glb", ".obj", ".stl"):
@@ -784,6 +1190,8 @@ def run_precompute(args: argparse.Namespace) -> None:
             "feat_dim": feat_dim,
             "n_points": args.n_points,
             "near_surface_fraction": args.near_surface_fraction,
+            "sharp_edge_fraction": args.sharp_edge_fraction,
+            "sharp_edge_angle_deg": args.sharp_edge_angle_deg,
             "elevations": args.elevations,
         }
         with open(dataset_dir / "metadata.json", "w") as f:
@@ -811,7 +1219,7 @@ def run_precompute(args: argparse.Namespace) -> None:
     pbar = tqdm(total=target_objects, unit="obj", dynamic_ncols=True,
                 desc=f"rank{rank}" if world_size > 1 else "precompute",
                 position=rank, leave=True)
-    obj_saved = obj_skipped = 0
+    obj_saved = obj_skipped = obj_repaired = 0
 
     for uid in uids_for_rank:
         if obj_saved >= target_objects:
@@ -819,8 +1227,8 @@ def run_precompute(args: argparse.Namespace) -> None:
 
         _done = [
             all((samples_dir / f"{uid}_az{int(az):03d}_el{int(el):03d}" / fn).exists()
-                for fn in ("triplane.pt", "query_pts.pt", "sdf_gt.pt",
-                           "camera_extrinsics.json", "input_image.png"))
+                for fn in ("triplane.pt", "query_pts.pt", "sdf_gt.pt", "normal_gt.pt",
+                           "image_tokens.pt", "camera_extrinsics.json", "input_image.png"))
             for az, el in view_pairs
         ]
         if all(_done):
@@ -842,11 +1250,7 @@ def run_precompute(args: argparse.Namespace) -> None:
             raw = _load_trimesh(mesh_path)
             mesh, _, _ = _normalize_mesh_copy(raw, radius)
             del raw  # raw is no longer needed; release before heavy SDF computation
-            if not mesh.is_watertight:
-                del mesh
-                obj_skipped += 1
-                pbar.set_postfix(objects=obj_saved, skipped=obj_skipped)
-                continue
+            # Triangle guard BEFORE repair so a pathological mesh can't stall voxelization.
             if args.max_triangles > 0 and len(mesh.faces) > args.max_triangles:
                 if args.verbose:
                     tqdm.write(f"[skip mesh] {uid}: {len(mesh.faces):,} faces > limit {args.max_triangles:,}")
@@ -854,6 +1258,32 @@ def run_precompute(args: argparse.Namespace) -> None:
                 obj_skipped += 1
                 pbar.set_postfix(objects=obj_saved, skipped=obj_skipped)
                 continue
+            if not mesh.is_watertight:
+                repaired = None
+                if args.repair_meshes:
+                    repaired, repair_method = repair_mesh_watertight(
+                        mesh, voxel_res=args.repair_voxel_res,
+                        voxel_method=args.repair_voxel_method)
+                if repaired is None:
+                    if args.verbose:
+                        tqdm.write(f"[skip mesh] {uid}: not watertight, repair failed")
+                    del mesh
+                    obj_skipped += 1
+                    pbar.set_postfix(objects=obj_saved, skipped=obj_skipped)
+                    continue
+                # Renormalize (voxel remesh can shift centroid/scale slightly) and
+                # persist so the training-time near-surface augment builds its BVH
+                # on the SAME geometry the GT SDF below is computed on.
+                mesh, _, _ = _normalize_mesh_copy(repaired, radius)
+                del repaired
+                obj_repaired += 1
+                try:
+                    mesh.export(os.path.join(cache_dir, uid, "repaired.obj"))
+                except Exception as e:
+                    if args.verbose:
+                        tqdm.write(f"[repair] {uid}: could not save repaired mesh ({e})")
+                if args.verbose:
+                    tqdm.write(f"[repair] {uid}: {repair_method}")
         except Exception as e:
             obj_skipped += 1
             pbar.set_postfix(objects=obj_saved, skipped=obj_skipped)
@@ -865,8 +1295,10 @@ def run_precompute(args: argparse.Namespace) -> None:
         query_pts_np = sample_query_points(
             mesh, args.n_points, radius,
             near_surface_fraction=args.near_surface_fraction,
+            sharp_edge_fraction=args.sharp_edge_fraction,
+            sharp_edge_angle_deg=args.sharp_edge_angle_deg,
         )
-        sdf_gt_np = compute_sdf(mesh, query_pts_np)
+        sdf_gt_np, normal_gt_np = compute_sdf(mesh, query_pts_np, return_normals=True)
 
         for (az, el), already_done in zip(view_pairs, _done):
             sample_id  = f"{uid}_az{int(az):03d}_el{int(el):03d}"
@@ -897,12 +1329,19 @@ def run_precompute(args: argparse.Namespace) -> None:
                 with torch.no_grad():
                     scene_codes = model([image_np], device=device)
                 triplane = scene_codes[0].half().cpu()
+
+                # 2b. Cache the DINO image-tokenizer output (frozen regardless of
+                # LoRA config — see compute_cached_image_tokens) so training can
+                # skip re-running the ViT every step.
+                image_tokens = compute_cached_image_tokens(model, image_np, device)
                 del image_np, scene_codes
 
                 # 3. Persist core training tensors only (no source_mesh.obj, no input_view.png).
                 torch.save(triplane, tmp_dir / "triplane.pt")
                 torch.save(torch.from_numpy(query_pts_np), tmp_dir / "query_pts.pt")
                 torch.save(torch.from_numpy(sdf_gt_np), tmp_dir / "sdf_gt.pt")
+                torch.save(image_tokens, tmp_dir / "image_tokens.pt")
+                torch.save(torch.from_numpy(normal_gt_np), tmp_dir / "normal_gt.pt")
 
                 tmp_dir.rename(sample_dir)
                 pbar.set_postfix(objects=obj_saved, skipped=obj_skipped, uid=uid[:8])
@@ -924,7 +1363,7 @@ def run_precompute(args: argparse.Namespace) -> None:
         pbar.update(1)
         pbar.set_postfix(objects=obj_saved, skipped=obj_skipped)
 
-        del mesh, query_pts_np, sdf_gt_np
+        del mesh, query_pts_np, sdf_gt_np, normal_gt_np
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -933,7 +1372,7 @@ def run_precompute(args: argparse.Namespace) -> None:
     if is_main:
         total_samples = obj_saved * n_views
         print(f"\nPrecompute done — {obj_saved} objects ({total_samples} samples), "
-              f"{obj_skipped} skipped -> {dataset_dir}")
+              f"{obj_repaired} repaired, {obj_skipped} skipped -> {dataset_dir}")
 
     del model
     if torch.cuda.is_available():
@@ -1108,7 +1547,14 @@ class SDFLazyDataset(Dataset):
     Each __getitem__ returns:
         pts_mesh : (N_POINTS, 3)          — query pts in normalized mesh frame
         sdf      : (N_POINTS,)            — GT SDF for uniform pts
-        img      : (H, W, 3) uint8 array  — input image; TripoSR runs inline in training
+        nrm      : (N_POINTS, 3)          — GT SDF gradient direction (mesh frame);
+                                            all-zeros for legacy datasets without
+                                            normal_gt.pt (masked out of the loss)
+        img      : (H, W, 3) uint8 array  — input image; used only if img_tokens
+                                            is a placeholder (legacy dataset)
+        img_tokens : (n_tokens, C) or (1,) — cached DINO image-tokenizer output;
+                                            (1,) placeholder if this dataset has
+                                            no image_tokens.pt (see has_cached_tokens)
         R        : (3, 3)                 — rotation mesh→triplane frame
         uid      : str                    — object UID (for loading mesh / BVH cache)
     """
@@ -1143,6 +1589,15 @@ class SDFLazyDataset(Dataset):
                 f"(e.g. {missing[0].name}). Re-run precompute to regenerate."
             )
 
+        # Dataset-wide flag (not per-sample): a dataset is precomputed in one
+        # pass, so it's either fully cached or not at all in practice. Training
+        # branches on this ONCE per outer step rather than handling a mixed
+        # batch, so a partially-upgraded dataset falls back to the slow path
+        # entirely until fully re-precomputed.
+        self.has_cached_tokens: bool = all(
+            (d / "image_tokens.pt").exists() for d in self.sample_dirs
+        )
+
     def __len__(self) -> int:
         return len(self.sample_dirs)
 
@@ -1152,9 +1607,44 @@ class SDFLazyDataset(Dataset):
         pts = torch.load(p / "query_pts.pt", map_location="cpu",
                          weights_only=False).clamp(-self.radius, self.radius)
         sdf = torch.load(p / "sdf_gt.pt", map_location="cpu", weights_only=False)
+        nrm_path = p / "normal_gt.pt"
+        if nrm_path.exists():
+            nrm = torch.load(nrm_path, map_location="cpu", weights_only=False)
+        else:
+            nrm = torch.zeros(pts.shape[0], 3)  # legacy dataset: no normal supervision
         uid = p.name.split("_az")[0]
         img = np.array(Image.open(p / "input_image.png").convert("RGB"))
-        return pts, sdf, img, R, uid
+        if self.has_cached_tokens:
+            img_tokens = torch.load(p / "image_tokens.pt", map_location="cpu", weights_only=False)
+        else:
+            img_tokens = torch.zeros(1)  # unused placeholder; training uses img instead
+        return pts, sdf, nrm, img, img_tokens, R, uid
+
+
+# ─── Mesh surface metrics ─────────────────────────────────────────────────────
+
+def mesh_surface_metrics(gt_mesh, pred_mesh, n_samples: int = 50000,
+                         fscore_tau: float = 0.01) -> dict:
+    """Chamfer-L2 + F-score between surface samples of two ALIGNED meshes.
+
+    Standard protocol (MeshLRM / TripoSG / Dora-bench): sample each surface,
+    take bidirectional nearest-neighbour distances; Chamfer is the sum of both
+    mean squared distances, F-score the harmonic mean of precision/recall at
+    ``fscore_tau``. Complements SDF MSE, which is dominated by far-field error
+    that marching cubes never sees.
+    """
+    from scipy.spatial import cKDTree
+    gt_pts   = np.asarray(gt_mesh.sample(n_samples),   dtype=np.float64)
+    pred_pts = np.asarray(pred_mesh.sample(n_samples), dtype=np.float64)
+    d_pred_to_gt = cKDTree(gt_pts).query(pred_pts, workers=-1)[0]
+    d_gt_to_pred = cKDTree(pred_pts).query(gt_pts, workers=-1)[0]
+    chamfer   = float((d_pred_to_gt ** 2).mean() + (d_gt_to_pred ** 2).mean())
+    precision = float((d_pred_to_gt < fscore_tau).mean())
+    recall    = float((d_gt_to_pred < fscore_tau).mean())
+    fscore    = (2 * precision * recall / (precision + recall)
+                 if precision + recall > 0 else 0.0)
+    return {"chamfer": chamfer, "fscore": fscore,
+            "precision": precision, "recall": recall}
 
 
 # ─── Visualization helpers ────────────────────────────────────────────────────
@@ -1275,7 +1765,14 @@ def reconstruct_mesh_from_triplane(
     if R_world_from_trip is not None:
         R = np.asarray(R_world_from_trip, dtype=np.float64)
         verts = verts @ R
-    return tr.Trimesh(vertices=verts, faces=faces, vertex_normals=normals)
+    # Do NOT pass skimage's `normals` as vertex_normals. For an SDF-like volume
+    # (negative inside) marching_cubes returns normals pointing INWARD — measured
+    # 100% inward on an analytic sphere — while the face WINDING is correct
+    # (signed volume +0.267 vs the true 0.268). Handing pyrender inward normals
+    # makes every surface shade as if facing away from the light, which is the
+    # black/patchy look in the wandb rows. Omitting them lets trimesh derive
+    # correct outward normals from the (correct) winding.
+    return tr.Trimesh(vertices=verts, faces=faces)
 
 
 def reconstruct_mesh_nerf_decoder(
@@ -1328,7 +1825,14 @@ def reconstruct_mesh_nerf_decoder(
     if R_world_from_trip is not None:
         R = np.asarray(R_world_from_trip, dtype=np.float64)
         verts = verts @ R
-    return tr.Trimesh(vertices=verts, faces=faces, vertex_normals=normals)
+    # Do NOT pass skimage's `normals` as vertex_normals. For an SDF-like volume
+    # (negative inside) marching_cubes returns normals pointing INWARD — measured
+    # 100% inward on an analytic sphere — while the face WINDING is correct
+    # (signed volume +0.267 vs the true 0.268). Handing pyrender inward normals
+    # makes every surface shade as if facing away from the light, which is the
+    # black/patchy look in the wandb rows. Omitting them lets trimesh derive
+    # correct outward normals from the (correct) winding.
+    return tr.Trimesh(vertices=verts, faces=faces)
 
 
 def create_mesh_comparison_visualization(
@@ -1434,10 +1938,13 @@ def visualize_reconstructions(
     nerf_threshold: float = 25.0,
     use_triplane_features: bool = True,
     triposr_model=None,  # required
+    fscore_tau: float = 0.01,
+    mesh_metric_samples: int = 50000,
 ) -> None:
     sdf_mlp.eval()
     triposr_model.eval()
 
+    label_metrics: dict[str, list] = {"seen": [], "unseen": []}
     for label, sample_dirs in (("seen", seen_dirs), ("unseen", unseen_dirs)):
         for sample_dir in sample_dirs:
             uid = sample_dir.name.split("_az")[0]
@@ -1446,6 +1953,12 @@ def visualize_reconstructions(
                 with torch.no_grad():
                     sc = triposr_model([img_np], device=device)
                 triplane = sc[0].detach().float().cpu()
+                # Second triplane from ORIGINAL TripoSR (LoRA off, pretrained
+                # post_processor) so the NeRF row below is a genuine
+                # stock-vs-fine-tuned comparison rather than the original
+                # density head decoding an already-fine-tuned triplane.
+                with torch.no_grad(), stock_triposr(triposr_model):
+                    triplane_stock = triposr_model([img_np], device=device)[0].detach().float().cpu()
 
                 R_np = load_R_world_from_recon_json_strict(sample_dir)
                 pred_mesh = reconstruct_mesh_from_triplane(
@@ -1468,7 +1981,11 @@ def visualize_reconstructions(
                 if not mesh_files:
                     tqdm.write(f"[vis] no cached mesh for {uid}")
                     continue
-                gt_mesh = load_and_normalize_mesh(str(mesh_files[0]), radius)
+                # Prefer the repaired (watertight) mesh saved at precompute — it is
+                # the geometry the GT SDF supervision was actually computed on.
+                repaired_files = [f for f in mesh_files if f.stem == "repaired"]
+                gt_mesh = load_and_normalize_mesh(
+                    str(repaired_files[0] if repaired_files else mesh_files[0]), radius)
 
                 # Parse azimuth and elevation from sample name: {uid}_az{az:03d}_el{el:03d}
                 suffix   = sample_dir.name.split("_az")[-1]  # e.g. "045_el015"
@@ -1492,7 +2009,7 @@ def visualize_reconstructions(
                     try:
                         nerf_mesh = reconstruct_mesh_nerf_decoder(
                             triposr_decoder,
-                            triplane,
+                            triplane_stock,   # ORIGINAL TripoSR, end to end
                             radius,
                             feature_reduction,
                             density_activation,
@@ -1507,10 +2024,28 @@ def visualize_reconstructions(
                     except Exception as e:
                         tqdm.write(f"[vis] NeRF decoder mesh failed for {uid}: {e}")
 
+                # ── Surface metrics: Chamfer / F-score vs GT (meshes are aligned:
+                # pred_mesh was rotated into world frame via R above) ───────────
+                mesh_metrics = None
+                try:
+                    mesh_metrics = mesh_surface_metrics(
+                        gt_mesh, pred_mesh,
+                        n_samples=mesh_metric_samples, fscore_tau=fscore_tau)
+                    label_metrics[label].append(mesh_metrics)
+                    tqdm.write(f"[vis] {label}/{uid[:12]}: "
+                               f"chamfer={mesh_metrics['chamfer']:.6f}  "
+                               f"fscore@{fscore_tau}={mesh_metrics['fscore']:.3f}")
+                except Exception as e:
+                    tqdm.write(f"[vis] surface metrics failed for {uid}: {e}")
+
+                title = f"{label} - {uid[:12]} - epoch {epoch}"
+                if mesh_metrics is not None:
+                    title += (f"  |  CD {mesh_metrics['chamfer']:.5f}"
+                              f"  F@{fscore_tau} {mesh_metrics['fscore']:.2f}")
                 save_path = output_dir / label / f"{uid}_epoch{epoch:04d}.png"
                 create_mesh_comparison_visualization(
                     gt_mesh, pred_mesh,
-                    title=f"{label} - {uid[:12]} - epoch {epoch}",
+                    title=title,
                     save_path=save_path,
                     input_image=input_image,
                     nerf_mesh=nerf_mesh,
@@ -1518,10 +2053,16 @@ def visualize_reconstructions(
 
                 if wandb_enabled:
                     try:
-                        wandb.log({
+                        log_dict = {
                             f"mesh_reconstruction/{label}/{sample_dir.name}": wandb.Image(str(save_path)),
                             "mesh_reconstruction/epoch": epoch,
-                        })
+                        }
+                        if mesh_metrics is not None:
+                            log_dict.update({
+                                f"mesh_metrics/{label}/{sample_dir.name}/chamfer": mesh_metrics["chamfer"],
+                                f"mesh_metrics/{label}/{sample_dir.name}/fscore": mesh_metrics["fscore"],
+                            })
+                        wandb.log(log_dict)
                     except Exception:
                         pass
 
@@ -1532,6 +2073,20 @@ def visualize_reconstructions(
 
             except Exception as e:
                 tqdm.write(f"[vis] failed for {uid}: {e}")
+
+    # ── Per-split means (the headline numbers to watch across epochs) ─────────
+    if wandb_enabled:
+        try:
+            mean_log: dict = {"mesh_reconstruction/epoch": epoch}
+            for label, ms in label_metrics.items():
+                if ms:
+                    mean_log[f"mesh_metrics/{label}/chamfer_mean"] = float(
+                        np.mean([m["chamfer"] for m in ms]))
+                    mean_log[f"mesh_metrics/{label}/fscore_mean"] = float(
+                        np.mean([m["fscore"] for m in ms]))
+            wandb.log(mean_log)
+        except Exception:
+            pass
 
     sdf_mlp.train()
 
@@ -1566,64 +2121,6 @@ def run_train(args: argparse.Namespace) -> None:
     # ── Dataset ───────────────────────────────────────────────────────────────
     dataset_dir = Path(args.dataset_dir)
     cache_dir = str(dataset_dir / "mesh_cache")
-
-    # ── Mesh path index for near-surface point sampling ──────────────────────
-    # BVHs are built fresh per outer training step (not cached) so memory stays
-    # bounded at SAMPLES_PER_BATCH meshes in RAM at a time per rank.
-    _uid_to_mesh_path: dict[str, str] = {}
-    mesh_cache_path = dataset_dir / "mesh_cache"
-    if mesh_cache_path.exists():
-        for uid_dir in mesh_cache_path.iterdir():
-            if uid_dir.is_dir():
-                files = [f for f in uid_dir.iterdir() if f.is_file()]
-                if files:
-                    _uid_to_mesh_path[uid_dir.name] = str(files[0])
-
-    def _build_batch_bvh(uids: list[str]) -> dict[str, tuple]:
-        """Build (mesh, ProximityQuery) for each unique UID in this batch.
-        Caller is responsible for deleting the returned dict when done."""
-        import trimesh as _tr
-        result: dict[str, tuple] = {}
-        for uid in set(uids):
-            if uid in result:
-                continue
-            path = _uid_to_mesh_path.get(uid)
-            if path is None:
-                continue
-            try:
-                mesh = load_and_normalize_mesh(path, radius)
-                if not mesh.is_watertight:
-                    continue
-                result[uid] = (mesh, _tr.proximity.ProximityQuery(mesh))
-            except Exception:
-                pass
-        return result
-
-    # Small chunk: trimesh on_surface transiently materializes
-    # (chunk × candidate-triangles-per-point) of data. Degenerate Objaverse
-    # meshes can yield tens of thousands of candidates per point, so a large
-    # chunk spikes tens of GB — fatal when 4 ranks query concurrently. The
-    # spike scales linearly with chunk size; 512 keeps it ~1-2 GB/rank.
-    _NEAR_SDF_CHUNK = 512
-
-    def _compute_near_surface_sdf(mesh, prox, pts_np: np.ndarray,
-                                  deadline: float | None = None):
-        """Return (sdf, n_done). Stops early once ``deadline`` (time.monotonic)
-        is passed so a pathologically slow mesh can't stall the rank — only the
-        first ``n_done`` points are valid and the caller truncates to match."""
-        face_normals = np.asarray(mesh.face_normals, dtype=np.float64)
-        sdf = np.empty(len(pts_np), dtype=np.float32)
-        n_done = 0
-        for i in range(0, len(pts_np), _NEAR_SDF_CHUNK):
-            if deadline is not None and time.monotonic() > deadline:
-                break
-            batch = pts_np[i : i + _NEAR_SDF_CHUNK]
-            closest, distances, tri_ids = prox.on_surface(batch)
-            direction = batch - closest
-            dot = np.einsum("ij,ij->i", direction, face_normals[tri_ids])
-            sdf[i : i + _NEAR_SDF_CHUNK] = np.where(dot >= 0, distances, -distances).astype(np.float32)
-            n_done = i + len(batch)
-        return sdf[:n_done], n_done
 
     def _compute_features(pts_mesh_g: torch.Tensor, sid_g: torch.Tensor,
                           triplanes_gpu: list, R_gpu: torch.Tensor):
@@ -1702,17 +2199,64 @@ def run_train(args: argparse.Namespace) -> None:
     # ── Test dataset (rank 0 only — eval never runs on other ranks) ───────────
     test_dataset: SDFLazyDataset | None = None
     test_loader = None
-    if is_main:
-        test_sample_names = (
-            {s for s in all_sample_names if s.split("_az")[0] in test_uids}
-            | test_view_names
-        )
+    if True:  # built on EVERY rank now — eval is sharded, see the eval block below
+        _unseen_uid_names  = {s for s in all_sample_names if s.split("_az")[0] in test_uids}
+        _unseen_view_names = set(test_view_names) - _unseen_uid_names
+        test_sample_names = _unseen_uid_names | _unseen_view_names
+        _n_full = len(test_sample_names)
+
+        # CAP THE TEST SET. It otherwise grows linearly with n_objects (360 @100
+        # objects, 3.6k @1k, 36k @10k) and is evaluated by RANK 0 ALONE every
+        # epoch with no collective inside. Past ~30 min of eval the other ranks,
+        # already blocked in the next epoch's DDP gradient all-reduce, trip the
+        # NCCL watchdog and the whole job dies — which is exactly what killed the
+        # 10k run. Capping also stops three GPUs idling through the eval.
+        # Sampling is STRATIFIED (keeps the unseen-UID : unseen-view ratio, since
+        # those measure two different kinds of generalization) and uses a FIXED
+        # seed, so the same subset is scored every epoch and across runs — test
+        # curves stay comparable rather than jittering with a fresh draw.
+        if 0 < args.test_max_samples < _n_full:
+            _rng  = random.Random(1234)
+            _frac = args.test_max_samples / _n_full
+            _keep: set = set()
+            for _grp in (_unseen_uid_names, _unseen_view_names):
+                _g = sorted(_grp)
+                if not _g:
+                    continue
+                _k = min(len(_g), max(1, round(len(_g) * _frac)))
+                _keep |= set(_rng.sample(_g, _k))
+            test_sample_names = _keep
+
+        # Every rank derives test_sample_names from the SAME fixed seeds (42/43
+        # for the splits, 1234 for the cap), so all ranks agree on the set and
+        # the shards below partition it cleanly.
         if test_sample_names:
             test_dataset = SDFLazyDataset(args.dataset_dir, sample_whitelist=test_sample_names)
-            test_loader = DataLoader(test_dataset, batch_size=args.samples_per_batch,
-                                     shuffle=False, num_workers=args.num_workers, pin_memory=False)
-            print(f"Test dataset: {len(test_dataset)} samples  "
-                  f"({len(test_uids)} unseen UIDs + {len(test_view_names)} unseen views)")
+            if is_ddp:
+                # shuffle=False -> deterministic, reproducible shards.
+                # drop_last=False -> DistributedSampler PADS to equal length, so every
+                # rank runs the same number of batches (a handful of samples may be
+                # double-counted when the size is not divisible by world_size; that
+                # is standard for eval and does not bias the mean materially).
+                test_sampler = DistributedSampler(test_dataset, num_replicas=world_size,
+                                                  rank=rank, shuffle=False, drop_last=False)
+                test_loader = DataLoader(test_dataset, batch_size=args.samples_per_batch,
+                                         sampler=test_sampler, num_workers=args.num_workers,
+                                         pin_memory=True,
+                                         persistent_workers=args.num_workers > 0)
+            else:
+                test_loader = DataLoader(test_dataset, batch_size=args.samples_per_batch,
+                                         shuffle=False, num_workers=args.num_workers,
+                                         pin_memory=True,
+                                         persistent_workers=args.num_workers > 0)
+            if is_main:
+                _n_uid  = sum(1 for s in test_sample_names if s in _unseen_uid_names)
+                _cap_note = (f"  [capped from {_n_full:,} by TEST_MAX_SAMPLES={args.test_max_samples:,}]"
+                             if len(test_sample_names) < _n_full else "")
+                _shard = f", sharded {world_size}-way (~{len(test_dataset)//world_size:,}/rank)" if is_ddp else ""
+                print(f"Test dataset: {len(test_dataset):,} samples "
+                      f"({_n_uid:,} unseen-UID + {len(test_sample_names) - _n_uid:,} unseen-view)"
+                      f"{_cap_note}{_shard}")
 
     # ── LoRA: load full TripoSR, inject adapters, build lora_optimizer ────────
     from tsr.system import TSR
@@ -1778,11 +2322,13 @@ def run_train(args: argparse.Namespace) -> None:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank,
                                      shuffle=True, drop_last=True)
         loader = DataLoader(dataset, batch_size=args.samples_per_batch, sampler=sampler,
-                            num_workers=args.num_workers, pin_memory=False, drop_last=True)
+                            num_workers=args.num_workers, pin_memory=True,
+                            persistent_workers=args.num_workers > 0, drop_last=True)
     else:
         sampler = None
         loader = DataLoader(dataset, batch_size=args.samples_per_batch, shuffle=True,
-                            num_workers=args.num_workers, pin_memory=False, drop_last=True)
+                            num_workers=args.num_workers, pin_memory=True,
+                            persistent_workers=args.num_workers > 0, drop_last=True)
 
     # ── Visualization samples ─────────────────────────────────────────────────
     def _pick_vis_from_uids(uid_set: set, n: int) -> list:
@@ -1857,19 +2403,62 @@ def run_train(args: argparse.Namespace) -> None:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         sdf_mlp.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
+        start_epoch = ckpt.get("epoch", 0)
         if "scheduler" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler"])
+            # OneCycleLR bakes total_steps into its state_dict. Restoring a
+            # checkpoint written under a DIFFERENT EPOCHS silently reinstates the
+            # old budget, then dies mid-run with "Tried to step N times. The
+            # specified number of total steps is M". Rebuild for the new budget
+            # instead, fast-forwarded to the steps already consumed.
+            _old_total = ckpt["scheduler"].get("total_steps")
+            if args.use_onecycle and _old_total is not None and _old_total != total_steps:
+                consumed = min(start_epoch * len(loader) * steps_per_outer, total_steps)
+                if is_main:
+                    print(f"[resume] EPOCHS changed since this checkpoint "
+                          f"(schedule was {_old_total} steps, now {total_steps}). "
+                          f"Rebuilding OneCycleLR, fast-forwarded to step {consumed}.")
+                for gparam in optimizer.param_groups:
+                    gparam.setdefault("initial_lr", args.lr / 25.0)  # OneCycle div_factor default
+                scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                    optimizer, max_lr=args.lr, total_steps=total_steps,
+                    pct_start=args.onecycle_pct_start, last_epoch=consumed - 1,
+                )
+            else:
+                scheduler.load_state_dict(ckpt["scheduler"])
         if "lora_model" in ckpt:
             triposr_model.load_state_dict(ckpt["lora_model"], strict=False)
         if "lora_optimizer" in ckpt:
             lora_optimizer.load_state_dict(ckpt["lora_optimizer"])
-        start_epoch = ckpt.get("epoch", 0)
+        # start_epoch was read above (the scheduler rebuild needs it).
         if is_main:
             print(f"Resumed from {args.resume} at epoch {start_epoch}")
 
     # ── DDP wrapping (after resume so we load into the raw module) ─────────────
     if is_ddp:
         sdf_mlp = DDP(sdf_mlp, device_ids=[local_rank])
+
+    # ── torch.compile (optional; suppress_errors falls back to eager per-graph
+    # rather than crashing training on a compile failure) ──────────────────────
+    # Hard guard: the eikonal term needs a double backward (autograd.grad with
+    # create_graph=True, then loss.backward()), which aot_autograd rejects at
+    # RUNTIME — dynamo's suppress_errors only covers graph-capture failures, so
+    # it cannot save us here. Refuse rather than crash 1 step into training.
+    _compile_ok = args.use_torch_compile and device.type == "cuda"
+    if _compile_ok and args.eikonal_weight > 0:
+        _compile_ok = False
+        if is_main:
+            print("[compile] DISABLED: eikonal_weight > 0 requires double backward, "
+                  "which torch.compile/aot_autograd does not support.")
+    if _compile_ok:
+        # MUST be "import ... as": a bare `import torch._dynamo` binds the name
+        # `torch` LOCALLY for this entire function, shadowing the module-level
+        # import and making every earlier `torch.*` use (e.g. torch.device at the
+        # top of run_train) raise UnboundLocalError. `import x.y as z` binds only z.
+        import torch._dynamo as _dynamo
+        _dynamo.config.suppress_errors = True
+        sdf_mlp = torch.compile(sdf_mlp)
+        if is_main:
+            print("[compile] sdf_mlp wrapped with torch.compile (suppress_errors=True).")
 
     # ── wandb (rank 0 only) ───────────────────────────────────────────────────
     _mlp_module = sdf_mlp.module if is_ddp else sdf_mlp
@@ -1925,13 +2514,11 @@ def run_train(args: argparse.Namespace) -> None:
         sdf_mlp.train()
         if sampler is not None:
             sampler.set_epoch(epoch)
-        epoch_loss = epoch_sdf = epoch_mse = epoch_eik = epoch_bce = 0.0
+        epoch_loss = epoch_sdf = epoch_mse = epoch_eik = epoch_bce = epoch_nrm = 0.0
         diag_steps = 0
         diag_sign_acc_sum = 0.0
         diag_preclip_norm_sum = 0.0
         diag_reject_frac_sum = 0.0
-        epoch_near_used_sum = 0
-        epoch_near_target_sum = 0
         diag_grad_mean_sum = 0.0
         diag_grad_min = float("inf")
         diag_grad_max = float("-inf")
@@ -1942,114 +2529,70 @@ def run_train(args: argparse.Namespace) -> None:
         if pbar is not None:
             pbar.set_description(f"Epoch {epoch + 1}/{args.epochs}")
 
-        for sample_pts, sample_sdf, sample_imgs, sample_R, sample_uids in loader:
-            # sample_pts:   (S, N, 3)       — uniform pts in mesh frame, CPU
-            # sample_sdf:   (S, N)          — GT SDF, CPU
-            # sample_imgs:  (S, H, W, 3)    — uint8 images; TripoSR runs inline
-            # sample_R:     (S, 3, 3)       — rotation matrix per sample, CPU
-            # sample_uids:  list[str]       — UID per sample
+        for sample_pts, sample_sdf, sample_nrm, sample_imgs, sample_img_tokens, sample_R, _sample_uids in loader:
+            # sample_pts:        (S, N, 3)       — uniform pts in mesh frame, CPU
+            # sample_sdf:        (S, N)          — GT SDF, CPU
+            # sample_nrm:        (S, N, 3)       — GT SDF gradient dir, mesh frame (zeros = legacy)
+            # sample_imgs:       (S, H, W, 3)    — uint8 images; only used if no cached tokens
+            # sample_img_tokens: (S, n_tok, C)   — cached DINO tokens, or (S, 1) placeholder
+            # sample_R:          (S, 3, 3)       — rotation matrix per sample, CPU
             S, N = sample_sdf.shape
             R_gpu = sample_R.to(device)  # (S, 3, 3)
 
-            # Run TripoSR with LoRA adapters to produce triplanes.
-            # Earlier frozen layers (DINO, backbone blocks 0-9) produce no
-            # grad_fn since their params have requires_grad=False, so PyTorch
-            # only retains the computation graph for LoRA blocks 10-15 and
-            # the post_processor — a modest memory footprint.
+            # Run TripoSR with LoRA adapters to produce triplanes — ONE batched
+            # forward pass for all S samples, not S sequential batch-1 calls.
+            # TSR.forward derives its batch size from the length of the image
+            # list, and there is no BatchNorm anywhere in the backbone (only
+            # LayerNorm/GroupNorm, both per-sample), so this is numerically
+            # equivalent to the old per-sample loop, just far better GPU
+            # utilization for a batch this small.
+            # If this dataset has cached DINO tokens (image_tokenizer is never
+            # touched by LoRA — see compute_cached_image_tokens), skip the ViT
+            # forward entirely and only run tokenizer→backbone→post_processor.
+            # bf16 autocast covers only this forward pass (the expensive
+            # LoRA-adapted transformer); the triplane is cast back to fp32
+            # immediately after so the SDF MLP + eikonal double-backward stay
+            # full precision, where numerical accuracy of the distance field
+            # matters most and the compute cost is negligible anyway.
             triposr_model.train()
-            triplanes_gpu = []
-            for s in range(S):
-                img_np = sample_imgs[s].numpy()  # (H, W, 3) uint8
-                scene_codes = triposr_model([img_np], device=device)
-                triplanes_gpu.append(scene_codes[0])  # [3, 40, 64, 64]
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
+                                enabled=(device.type == "cuda")):
+                if dataset.has_cached_tokens:
+                    scene_codes = triposr_forward_from_cached_tokens(
+                        triposr_model, sample_img_tokens.to(device))
+                else:
+                    img_batch = [sample_imgs[s].numpy() for s in range(S)]  # each (H, W, 3) uint8
+                    scene_codes = triposr_model(img_batch, device=device)
+            triplanes_gpu = [scene_codes[s].float() for s in range(S)]  # [3, 40, 64, 64] each
+
+            # Detach each sample's triplane into a fresh leaf. Every minibatch
+            # below backprops only into this leaf (cheap: bilinear sampling +
+            # the small SDF MLP) — never into the expensive LoRA/TripoSR graph
+            # directly. PyTorch accumulates each minibatch's contribution onto
+            # the leaf's .grad for free, across all steps_per_outer minibatches.
+            # The REAL upstream graph is backpropped only once per sample, at
+            # the end of the outer step (search "graph split" below), using
+            # that accumulated leaf gradient — mathematically identical total
+            # gradient to backpropping the full graph every minibatch (proven:
+            # same result by linearity of differentiation), but the expensive
+            # part now runs S times per outer step instead of steps_per_outer
+            # (~32) times.
+            triplane_leaves = [t.detach().requires_grad_(True) for t in triplanes_gpu]
 
             # Point pool, all in mesh frame on CPU. Features are NEVER stored
             # here — only raw 3-float points, scalar SDF, and a sample-id tag.
+            # Uniform/near-surface/sharp-edge mix is fixed at precompute time
+            # (sample_query_points) — no online resampling pass here.
             pool_pts = sample_pts.reshape(S * N, 3)             # (S*N, 3) view
             pool_sdf = sample_sdf.reshape(S * N)                # (S*N,)
+            pool_nrm = sample_nrm.reshape(S * N, 3)             # (S*N, 3) view
             pool_sid = torch.arange(S).repeat_interleave(N)     # (S*N,)
-
-            # ── Pass 1: probe uniform pts in chunks → near-surface mask ───────
-            # Forward-only, no gradient. Use detached triplanes so we don't
-            # build or retain any LoRA computation graph here.
-            triplanes_probe = [t.detach() for t in triplanes_gpu]
-            near_mask = torch.zeros(S * N, dtype=torch.bool)
-            with torch.no_grad():
-                for start in range(0, S * N, args.batch_size):
-                    end = min(start + args.batch_size, S * N)
-                    pm  = pool_pts[start:end].to(device)
-                    sg  = pool_sid[start:end].to(device)
-                    feats, pts_trip = _compute_features(pm, sg, triplanes_probe, R_gpu)
-                    if n_freqs > 0:
-                        if args.use_triplane_features:
-                            p1_in = torch.cat([feats, fourier_encode(pts_trip, n_freqs)], dim=-1)
-                        else:
-                            p1_in = fourier_encode(pts_trip, n_freqs)
-                    else:
-                        p1_in = feats if args.use_triplane_features else torch.empty(0)
-                    pred = sdf_mlp(p1_in)
-                    near_mask[start:end] = (pred.abs() < args.near_surface_threshold).cpu()
-
-            # ── Pass 2: perturb near-surface pts, compute GT SDF, append to pool ─
-            # Operates entirely in mesh frame; no features computed here. BVHs
-            # are built per-step and freed immediately.
-            batch_bvh = _build_batch_bvh(list(sample_uids))
-            extra_pts: list[torch.Tensor] = []
-            extra_sdf: list[torch.Tensor] = []
-            extra_sid: list[torch.Tensor] = []
-            # Wall-clock budget so a slow degenerate mesh can't desync DDP ranks.
-            augment_deadline = time.monotonic() + args.augment_budget_sec
-            for s in range(S):
-                if time.monotonic() > augment_deadline:
-                    break  # out of budget — skip remaining samples this step
-                bvh = batch_bvh.get(sample_uids[s])
-                if bvh is None:
-                    continue
-                mesh_s, prox_s = bvh
-                s_mask  = near_mask[s * N : (s + 1) * N]
-                ns_mesh = sample_pts[s][s_mask]        # (k, 3) flagged near-surface, mesh frame
-                if ns_mesh.shape[0] == 0:
-                    continue
-                # Resample the flagged points (with replacement) up/down to a
-                # target count = ratio × N (the per-sample uniform count). With
-                # ratio=1 this requests as many near-surface points as uniform
-                # ones. Independent noise below makes duplicates distinct.
-                # NOTE: the per-step time budget may still truncate how many are
-                # actually computed (see n_done), so the realised count can be
-                # lower for slow meshes.
-                target = max(1, int(N * args.near_surface_ratio))
-                sel = torch.randint(0, ns_mesh.shape[0], (target,))
-                ns_mesh = ns_mesh[sel]
-                new_mesh = (ns_mesh + torch.randn_like(ns_mesh) * args.near_surface_sigma
-                            ).clamp(-float(radius), float(radius))
-                new_sdf_np, n_done = _compute_near_surface_sdf(
-                    mesh_s, prox_s, new_mesh.numpy().astype(np.float64),
-                    deadline=augment_deadline)
-                if n_done == 0:
-                    continue
-                new_mesh = new_mesh[:n_done]  # truncate to points actually computed
-                extra_pts.append(new_mesh)
-                extra_sdf.append(torch.from_numpy(new_sdf_np))
-                extra_sid.append(torch.full((new_mesh.shape[0],), s, dtype=torch.long))
-            del batch_bvh
-            gc.collect()
-
-            # Near-surface points actually computed this step (the time budget
-            # may truncate below the per-step target of S × ratio × N).
-            near_used_step = int(sum(e.shape[0] for e in extra_pts))
-            near_target_step = S * max(1, int(N * args.near_surface_ratio))
-            epoch_near_used_sum   += near_used_step
-            epoch_near_target_sum += near_target_step
-
-            if extra_pts:
-                pool_pts = torch.cat([pool_pts] + extra_pts, dim=0)
-                pool_sdf = torch.cat([pool_sdf] + extra_sdf, dim=0)
-                pool_sid = torch.cat([pool_sid] + extra_sid, dim=0)
 
             # ── Shuffle pool (cross-sample mixing) and train in mini-batches ──
             perm = torch.randperm(pool_pts.shape[0])
             pool_pts = pool_pts[perm]
             pool_sdf = pool_sdf[perm]
+            pool_nrm = pool_nrm[perm]
             pool_sid = pool_sid[perm]
 
             # LoRA grads accumulate across ALL mini-batches in this outer step,
@@ -2058,26 +2601,22 @@ def run_train(args: argparse.Namespace) -> None:
             lora_optimizer.zero_grad()
 
             # CRITICAL for DDP: every rank must run the SAME number of backward
-            # / gradient all-reduce calls. The pool size varies per rank (each
-            # adds a different number of near-surface points), so we iterate a
-            # FIXED count (steps_per_outer = S*N / batch_size) instead of over
-            # the whole pool. The shuffle ensures the fixed window still samples
-            # a proportional blend of uniform + near-surface points. Mismatched
-            # collective counts across ranks would deadlock at the next
-            # all-reduce — exactly the NCCL timeout we hit.
+            # / gradient all-reduce calls. Pool size is now fixed at S*N (no
+            # online augment appending a variable count), so steps_per_outer
+            # (= S*N / batch_size) tiles through the whole shuffled pool once.
             for mb in range(steps_per_outer):
                 start = mb * args.batch_size
                 end   = start + args.batch_size
                 pm     = pool_pts[start:end].to(device)
                 sg     = pool_sid[start:end].to(device)
                 sdf_gt = pool_sdf[start:end].to(device)
-                is_last_mb = (mb == steps_per_outer - 1)
+                nrm_gt = pool_nrm[start:end].to(device)
 
                 # Gradient flows from sdf_pred through base_feats → triplane
-                # → LoRA adapters.  pts_trip is detached before being used
-                # as query_pts so the eikonal ∂sdf/∂query_pts graph is
-                # independent of the LoRA graph.
-                base_feats, pts_trip = _compute_features(pm, sg, triplanes_gpu, R_gpu)
+                # LEAF only (never into LoRA/TripoSR here — see graph split
+                # above). pts_trip is detached before being used as query_pts
+                # so the eikonal ∂sdf/∂query_pts graph is independent too.
+                base_feats, pts_trip = _compute_features(pm, sg, triplane_leaves, R_gpu)
                 query_pts = pts_trip.detach().requires_grad_(True)
 
                 if n_freqs > 0:
@@ -2097,7 +2636,17 @@ def run_train(args: argparse.Namespace) -> None:
                 # touches the squared-error term — BCE is bounded and doesn't
                 # need it. Reducing over a mask does NOT change the number of
                 # backward() calls, so DDP stays in lockstep.
-                per_point = surface_weighted_se(sdf_pred, sdf_gt, sigma=args.surface_loss_sigma)
+                # TSDF clamp (DeepSDF): regress clamped values so capacity focuses
+                # near the surface; the weighting still uses the UNCLAMPED GT so
+                # near-surface emphasis is preserved. Sign-BCE (raw pred) and
+                # eikonal keep steering badly-wrong far-field points.
+                if args.sdf_clamp > 0:
+                    _c = float(args.sdf_clamp)
+                    per_point = surface_weighted_se(
+                        sdf_pred.clamp(-_c, _c), sdf_gt.clamp(-_c, _c),
+                        sigma=args.surface_loss_sigma, weight_target=sdf_gt)
+                else:
+                    per_point = surface_weighted_se(sdf_pred, sdf_gt, sigma=args.surface_loss_sigma)
                 reject_frac = 0.0
                 if args.loss_reject_k > 0 and per_point.numel() > 1:
                     with torch.no_grad():
@@ -2124,18 +2673,37 @@ def run_train(args: argparse.Namespace) -> None:
                 grad_norm = gradients.norm(dim=-1)
                 eikonal_loss = ((grad_norm - 1.0) ** 2).mean()
 
+                # ── Surface-normal alignment (IGR / TripoSG): align ∇f with the
+                # GT SDF gradient direction at near-surface points. Normals are
+                # stored in mesh frame; rotate into the triplane frame that the
+                # gradients live in (n_trip = R @ n_mesh, same map as points).
+                # Zero-norm normals (legacy datasets) are masked out.
+                if args.normal_loss_weight > 0:
+                    nrm_trip = torch.einsum("bij,bj->bi", R_gpu[sg], nrm_gt)
+                    nrm_valid = ((sdf_gt.abs() < args.normal_loss_threshold)
+                                 & (nrm_trip.norm(dim=-1) > 0.5))
+                    if nrm_valid.any():
+                        g_pred = F.normalize(gradients[nrm_valid], dim=-1, eps=1e-8)
+                        g_gt   = F.normalize(nrm_trip[nrm_valid], dim=-1, eps=1e-8)
+                        normal_loss = (1.0 - (g_pred * g_gt).sum(dim=-1)).mean()
+                    else:
+                        normal_loss = sdf_pred.new_zeros(())
+                else:
+                    normal_loss = sdf_pred.new_zeros(())
+
                 loss = (sdf_loss
                         + args.eikonal_weight * eikonal_loss
-                        + args.sign_bce_weight * bce_loss)
+                        + args.sign_bce_weight * bce_loss
+                        + args.normal_loss_weight * normal_loss)
 
                 optimizer.zero_grad()
-                # Retain the TripoSR computation graph across all mini-batches
-                # so accumulated LoRA grads are correct; the final mini-batch
-                # frees the graph as usual.
-                if not is_last_mb:
-                    loss.backward(retain_graph=True)
-                else:
-                    loss.backward()
+                # No retain_graph needed: this minibatch's graph only reaches
+                # back to triplane_leaves (a leaf) and the SDF MLP — nothing
+                # here is shared with any other minibatch's graph, so it's
+                # freed immediately as usual. The leaf's accumulated .grad is
+                # what carries this minibatch's contribution to the LoRA
+                # gradient forward to the graph-split backward after the loop.
+                loss.backward()
                 # clip_grad_norm_ returns the TOTAL norm BEFORE clipping — log it
                 # to see whether clipping is actually engaging.
                 preclip_norm = float(
@@ -2149,6 +2717,7 @@ def run_train(args: argparse.Namespace) -> None:
                 epoch_mse  += F.mse_loss(sdf_pred.detach(), sdf_gt).item()
                 epoch_eik  += eikonal_loss.item()
                 epoch_bce  += bce_loss.item()
+                epoch_nrm  += normal_loss.item()
                 with torch.no_grad():
                     diag_sign_acc_sum += float(
                         (torch.sign(sdf_pred) == torch.sign(sdf_gt)).float().mean().item())
@@ -2184,56 +2753,75 @@ def run_train(args: argparse.Namespace) -> None:
                             "train/sdf_loss": sdf_loss.item(),
                             "train/eikonal_loss": eikonal_loss.item(),
                             "train/sign_bce_loss": bce_loss.item(),
+                            "train/normal_loss": normal_loss.item(),
                             "train/grad_norm_preclip": preclip_norm,
                             "train/lr": optimizer.param_groups[0]["lr"],
                         })
                     except Exception:
                         pass
 
+            # ── Graph split: backprop the accumulated leaf gradients through
+            # the REAL upstream (LoRA/TripoSR) graph — S backward calls here
+            # instead of one per minibatch (steps_per_outer, ~32). All S slices
+            # trace back to the SAME single batched TripoSR forward (item-4
+            # batching), so retain_graph=True is needed until the last one
+            # actually issued.
+            leaf_grads = [(s, triplane_leaves[s].grad) for s in range(S)
+                         if triplane_leaves[s].grad is not None]
+            for i, (s, g) in enumerate(leaf_grads):
+                triplanes_gpu[s].backward(g, retain_graph=(i < len(leaf_grads) - 1))
+
             # ── LoRA optimizer step (once per outer step, after all mini-batches) ──
             if is_ddp:
                 # Manually sync accumulated LoRA grads across ranks before stepping.
+                # all_reduce is a COLLECTIVE: every rank must issue exactly the same
+                # number of calls in the same order or the mismatched ranks hang until
+                # the NCCL timeout. Grads therefore must NOT be skipped when None —
+                # and None is the norm, not the exception, since zero_grad() defaults
+                # to set_to_none=True, so each outer step starts with every grad None
+                # and they are only repopulated by the graph-split backward above.
+                # Materialize zeros instead of skipping: a zero contribution is
+                # mathematically correct and keeps all ranks in lockstep.
                 for p in lora_trainable_params:
-                    if p.grad is not None:
-                        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-                        p.grad.div_(world_size)
+                    if p.grad is None:
+                        p.grad = torch.zeros_like(p)
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                    p.grad.div_(world_size)
             torch.nn.utils.clip_grad_norm_(lora_trainable_params, args.grad_clip)
             lora_optimizer.step()
 
             # Free GPU-resident triplanes before the next outer step
-            del triplanes_gpu, triplanes_probe, R_gpu
+            del triplanes_gpu, triplane_leaves, R_gpu
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
         # ── End of epoch ──────────────────────────────────────────────────────
         # Aggregate losses across ranks so rank-0 logs the global average.
         if is_ddp:
-            t = torch.tensor([epoch_loss, epoch_sdf, epoch_mse, epoch_eik, epoch_bce], device=device)
+            t = torch.tensor([epoch_loss, epoch_sdf, epoch_mse, epoch_eik, epoch_bce, epoch_nrm], device=device)
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
-            epoch_loss, epoch_sdf, epoch_mse, epoch_eik, epoch_bce = (t / world_size).tolist()
+            epoch_loss, epoch_sdf, epoch_mse, epoch_eik, epoch_bce, epoch_nrm = (t / world_size).tolist()
 
         if is_main:
             n = len(loader)
+            # Loss accumulators are summed per INNER minibatch, so normalise by
+            # the inner-step count (diag_steps) to get a true mean — NOT by
+            # len(loader) (outer steps), which would inflate by steps_per_outer.
+            _ns = diag_steps if diag_steps > 0 else 1
             grad_mean_epoch = (diag_grad_mean_sum / diag_steps) if diag_steps > 0 else float("nan")
             sign_acc_epoch = (diag_sign_acc_sum / diag_steps) if diag_steps > 0 else float("nan")
             preclip_epoch = (diag_preclip_norm_sum / diag_steps) if diag_steps > 0 else float("nan")
             reject_epoch = (diag_reject_frac_sum / diag_steps) if diag_steps > 0 else float("nan")
-            # Near-surface points actually used (per rank, per outer step) and the
-            # fraction of the requested target realised (1.0 = budget never truncated).
-            near_used_epoch = (epoch_near_used_sum / n) if n > 0 else float("nan")
-            near_frac_epoch = (epoch_near_used_sum / epoch_near_target_sum
-                               if epoch_near_target_sum > 0 else float("nan"))
             if wandb_enabled:
                 try:
                     wandb.log({
-                        "train/epoch_loss": epoch_loss / n,
-                        "train/epoch_sdf_loss": epoch_sdf / n,
-                        "train/epoch_mse": epoch_mse / n,
-                        "train/epoch_eikonal_loss": epoch_eik / n,
-                        "train/epoch_sign_bce_loss": epoch_bce / n,
+                        "train/epoch_loss": epoch_loss / _ns,
+                        "train/epoch_sdf_loss": epoch_sdf / _ns,
+                        "train/epoch_mse": epoch_mse / _ns,
+                        "train/epoch_eikonal_loss": epoch_eik / _ns,
+                        "train/epoch_sign_bce_loss": epoch_bce / _ns,
+                        "train/epoch_normal_loss": epoch_nrm / _ns,
                         "diag/sign_accuracy": sign_acc_epoch,
-                        "diag/near_points_used": near_used_epoch,
-                        "diag/near_points_frac": near_frac_epoch,
                         "diag/grad_norm_preclip_mean": preclip_epoch,
                         "diag/reject_frac_mean": reject_epoch,
                         "diag/grad_norm_mean": grad_mean_epoch,
@@ -2248,20 +2836,35 @@ def run_train(args: argparse.Namespace) -> None:
                 except Exception:
                     pass
 
-        # ── Test evaluation (rank 0 only) ─────────────────────────────────────
-        if is_main and test_loader is not None:
+        # ── Test evaluation (SHARDED across ranks) ────────────────────────────
+        # Previously rank 0 evaluated the whole test set alone while the other
+        # ranks sat blocked in the next epoch's DDP gradient all-reduce; once
+        # that exceeded NCCL_TIMEOUT_MIN the job died (the 10k-object failure).
+        # Now every rank scores its own shard and the partial sums are reduced.
+        #
+        # CRITICAL: the accumulator and the all_reduce live OUTSIDE the
+        # `test_loader is not None` guard. all_reduce is a collective — if any
+        # rank skipped it we would deadlock in exactly the way this change is
+        # meant to prevent. A rank with no shard simply contributes zeros.
+        _test_acc = torch.zeros(5, device=device)   # [weighted, mse, mse_clamped, sign_acc, steps]
+        if test_loader is not None:
             _mlp_module.eval()
             triposr_model.eval()
-            test_weighted_sum = test_mse_sum = test_sign_acc_sum = 0.0
+            test_weighted_sum = test_mse_sum = test_mse_clamped_sum = test_sign_acc_sum = 0.0
             test_steps = 0
             with torch.no_grad():
-                for t_pts, t_sdf, t_imgs, t_R, _ in test_loader:
+                for t_pts, t_sdf, _t_nrm, t_imgs, t_img_tokens, t_R, _ in test_loader:
                     tS, tN = t_sdf.shape
                     t_R_gpu = t_R.to(device)
-                    t_trip_gpu = []
-                    for s in range(tS):
-                        sc = triposr_model([t_imgs[s].numpy()], device=device)
-                        t_trip_gpu.append(sc[0])
+                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
+                                        enabled=(device.type == "cuda")):
+                        if test_dataset.has_cached_tokens:
+                            t_scene_codes = triposr_forward_from_cached_tokens(
+                                triposr_model, t_img_tokens.to(device))
+                        else:
+                            t_img_batch = [t_imgs[s].numpy() for s in range(tS)]
+                            t_scene_codes = triposr_model(t_img_batch, device=device)
+                    t_trip_gpu = [t_scene_codes[s].float() for s in range(tS)]
                     t_pool_pts = t_pts.reshape(tS * tN, 3)
                     t_pool_sdf = t_sdf.reshape(tS * tN)
                     t_pool_sid = torch.arange(tS).repeat_interleave(tN)
@@ -2281,20 +2884,39 @@ def run_train(args: argparse.Namespace) -> None:
                         t_pred = _mlp_module(t_model_feats)
                         test_weighted_sum += surface_weighted_mse_loss(t_pred, ms, sigma=args.surface_loss_sigma).item()
                         test_mse_sum += F.mse_loss(t_pred, ms).item()
+                        if args.sdf_clamp > 0:
+                            _tc = float(args.sdf_clamp)
+                            test_mse_clamped_sum += F.mse_loss(
+                                t_pred.clamp(-_tc, _tc), ms.clamp(-_tc, _tc)).item()
                         test_sign_acc_sum += float((torch.sign(t_pred) == torch.sign(ms)).float().mean().item())
                         test_steps += 1
                     del t_trip_gpu, t_R_gpu
             _mlp_module.train()
-            if wandb_enabled and test_steps > 0:
-                try:
-                    wandb.log({
-                        "test/epoch_sdf_loss": test_weighted_sum / test_steps,
-                        "test/epoch_mse": test_mse_sum / test_steps,
-                        "test/sign_accuracy": test_sign_acc_sum / test_steps,
-                        "train/epoch": epoch + 1,
-                    })
-                except Exception:
-                    pass
+            _test_acc = torch.tensor(
+                [test_weighted_sum, test_mse_sum, test_mse_clamped_sum,
+                 test_sign_acc_sum, float(test_steps)], device=device)
+
+        # Reduce partial sums from every shard. Unconditional under DDP so all
+        # ranks issue exactly one collective here, in the same order, always.
+        if is_ddp:
+            dist.all_reduce(_test_acc, op=dist.ReduceOp.SUM)
+        _tw, _tm, _tmc, _tsa, _tsteps = _test_acc.tolist()
+
+        if is_main and wandb_enabled and _tsteps > 0:
+            try:
+                # Divide by the GLOBAL step count so the result is the mean over
+                # the whole test set, not over one shard.
+                _test_log = {
+                    "test/epoch_sdf_loss": _tw / _tsteps,
+                    "test/epoch_mse": _tm / _tsteps,
+                    "test/sign_accuracy": _tsa / _tsteps,
+                    "train/epoch": epoch + 1,
+                }
+                if args.sdf_clamp > 0:
+                    _test_log["test/epoch_mse_clamped"] = _tmc / _tsteps
+                wandb.log(_test_log)
+            except Exception:
+                pass
 
         # Cosine steps per epoch; OneCycle already stepped per minibatch.
         if not args.use_onecycle:
@@ -2343,6 +2965,8 @@ def run_train(args: argparse.Namespace) -> None:
                 density_bias=_density_bias,
                 use_triplane_features=args.use_triplane_features,
                 triposr_model=triposr_model,
+                fscore_tau=args.fscore_tau,
+                mesh_metric_samples=args.mesh_metric_samples,
             )
 
     if pbar is not None:
@@ -2377,6 +3001,11 @@ def main() -> None:
         azimuths_per_mesh = AZIMUTHS_PER_MESH,
         elevations     = ELEVATIONS,
         near_surface_fraction = NEAR_SURFACE_FRACTION,
+        sharp_edge_fraction   = SHARP_EDGE_FRACTION,
+        sharp_edge_angle_deg  = SHARP_EDGE_ANGLE_DEG,
+        repair_meshes         = REPAIR_MESHES,
+        repair_voxel_res      = REPAIR_VOXEL_RES,
+        repair_voxel_method   = REPAIR_VOXEL_METHOD,
         n_points       = N_POINTS,
         image_size     = IMAGE_SIZE,
         fov            = FOV,
@@ -2401,11 +3030,11 @@ def main() -> None:
         sign_bce_alpha         = SIGN_BCE_ALPHA,
         sign_bce_epsilon       = SIGN_BCE_EPSILON,
         surface_loss_sigma     = SURFACE_LOSS_SIGMA,
-        near_surface_sigma     = NEAR_SURFACE_SIGMA,
-        near_surface_threshold = NEAR_SURFACE_THRESHOLD,
-        near_surface_ratio     = NEAR_SURFACE_RATIO,
-        augment_budget_sec     = AUGMENT_BUDGET_SEC,
         sdf_clamp              = SDF_CLAMP,
+        normal_loss_weight     = NORMAL_LOSS_WEIGHT,
+        normal_loss_threshold  = NORMAL_LOSS_THRESHOLD,
+        fscore_tau             = FSCORE_TAU,
+        mesh_metric_samples    = MESH_METRIC_SAMPLES,
         num_workers    = NUM_WORKERS,
         run_name       = RUN_NAME,
         weight_decay   = WEIGHT_DECAY,
@@ -2413,6 +3042,7 @@ def main() -> None:
         use_triplane_features = USE_TRIPLANE_FEATURES,
         test_fraction  = TEST_FRACTION,
         test_view_fraction = TEST_VIEW_FRACTION,
+        test_max_samples   = TEST_MAX_SAMPLES,
         vis_every      = VIS_EVERY,
         vis_seen       = VIS_SEEN,
         vis_unseen     = VIS_UNSEEN,
@@ -2422,6 +3052,7 @@ def main() -> None:
         samples_per_batch = SAMPLES_PER_BATCH,
         resume         = RESUME,
         use_nerf_vis   = USE_NERF_VIS,
+        use_torch_compile = USE_TORCH_COMPILE,
         lora_rank           = LORA_RANK,
         lora_alpha          = LORA_ALPHA,
         lora_block_start    = LORA_BLOCK_START,
