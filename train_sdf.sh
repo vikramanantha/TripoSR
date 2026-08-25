@@ -75,8 +75,41 @@ run() {
 
 cd "$SCRIPT_DIR"
 
+# ── Precompute restart prompt ────────────────────────────────────────────────
+# run_precompute() only prompts "delete and restart?" when it is a SINGLE
+# process — under torchrun it can't (4 ranks would each prompt), so it silently
+# resumes instead. Resuming onto a dataset built with different settings is a
+# real hazard: samples are only regenerated if FILES ARE MISSING, so a stale
+# half of the dataset keeps its old point distribution and (pre-token-caching)
+# missing image_tokens.pt, which silently forces the slow training path
+# dataset-wide. So ask here, once, before launching any ranks.
+prompt_precompute_restart() {
+    local ds_dir samples_dir existing
+    ds_dir=$("$PYTHON" - "$PY_SCRIPT" <<'PYEOF'
+import re, sys
+src = open(sys.argv[1]).read()
+m = re.search(r'^DATASET_DIR\s*=\s*"([^"]+)"', src, re.M)
+print(m.group(1) if m else "")
+PYEOF
+)
+    [[ -z "$ds_dir" ]] && return 0
+    samples_dir="$ds_dir/samples"
+    [[ -d "$samples_dir" ]] || return 0
+    existing=$(find "$samples_dir" -maxdepth 1 -mindepth 1 -not -name '_tmp*' | wc -l)
+    [[ "$existing" -eq 0 ]] && return 0
+    echo "Found $existing existing samples in $samples_dir."
+    read -r -p "Delete all and restart? [y/N] " answer
+    if [[ "$answer" =~ ^[Yy]([Ee][Ss])?$ ]]; then
+        rm -rf "$samples_dir"
+        echo "Deleted existing samples."
+    else
+        echo "Keeping existing samples (will skip already-done views)."
+        echo "NOTE: mixing samples from different precompute settings is unsupported."
+    fi
+}
+
 case "$MODE" in
-    precompute) "$PYTHON" "$PY_SCRIPT" --command precompute ;;
+    precompute) prompt_precompute_restart; run precompute ;;
     train)      run train ;;
-    both)       "$PYTHON" "$PY_SCRIPT" --command precompute && run train ;;
+    both)       prompt_precompute_restart; run precompute && run train ;;
 esac

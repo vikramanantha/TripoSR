@@ -93,6 +93,8 @@ def obj_to_urdf(obj_path: str) -> str:
 def fetch_objaverse_urdf(uid: str, cache_dir: str) -> str:
     """Download *uid* from Objaverse, convert to OBJ+URDF, return URDF path."""
     import objaverse
+    from objaverse_paths import configure_objaverse
+    configure_objaverse()
 
     urdf_path = os.path.join(cache_dir, uid, f"{uid}.urdf")
     if os.path.exists(urdf_path):
@@ -116,6 +118,8 @@ def fetch_objaverse_urdf(uid: str, cache_dir: str) -> str:
 def uid_from_index(index: int) -> str:
     """Return the Objaverse UID at position *index* in the full UID list."""
     import objaverse
+    from objaverse_paths import configure_objaverse
+    configure_objaverse()
     print(f"[objaverse] Loading UID list…")
     uids = objaverse.load_uids()
     uids_list = list(uids)

@@ -1,5 +1,18 @@
 """
-infer_sdf_mesh.py  —  SDF MLP inference on a new mesh.
+infer_old.py  —  SDF MLP inference on a new mesh (BATCH pipeline).
+
+Snapshot of infer_sdf_mesh.py BEFORE the interactive UI-first viewer, the
+live X/Y/Z preview sliders, the repaired/watertight-mesh matching, and the
+greyscale (material-stripping) option were added. Computes everything first,
+then opens the three-way Gradio viewer, as it originally did.
+
+Kept from the later work (these were bug fixes / explicitly requested, not
+part of the reverted features):
+  * apply_finetuned_lora() -- loads ckpt["lora_model"]. Without it the SDF MLP
+    is fed STOCK triplanes it was never trained on and the output is garbage.
+  * two-pass pointwise SDF MSE (raw + TSDF-clamped).
+  * CONFIGURATION globals so it runs with no CLI arguments.
+  * NeRF baseline decodes the STOCK triplane (unmodified TripoSR end to end).
 
 Given a saved SDF MLP checkpoint (from train_sdf_head.py) and a mesh source
 (Objaverse UID, UID index, or local file), this script:
@@ -51,7 +64,6 @@ block and visualize_sdf_diagnostics.py).
 
 import argparse
 import gc
-import itertools
 import os
 import shutil
 import sys
@@ -102,7 +114,7 @@ from view_mesh import (
 # CONFIGURATION — used for any value not passed on the command line
 # ═══════════════════════════════════════════════════════════════════════════════
 
-CHECKPOINT = "/home/markiv/TripoSR/sdf_checkpoints/sdf_head_v0.64_1k_epoch0475.pt"
+CHECKPOINT = "/home/markiv/TripoSR/sdf_checkpoints/sdf_head_v0.61_100_epoch0175.pt"
 MODEL      = "stabilityai/TripoSR"
 
 # Mesh source — the first non-None of these three wins.
@@ -112,15 +124,6 @@ UID: str | None       = "91ceac9fa0d14f6a9813765ea2e21b1b" # "b55517c209d74762b3
 UID_INDEX: int | None = 1
 MESH: str | None      = None
 
-DATASET_DIR    = "/home/markiv/TripoSR/sdf_dataset"  # only used to find cached repaired.obj
-INTERACTIVE    = True   # launch the Gradio UI first and compute on demand
-GREYSCALE      = True   # strip materials/textures so the mesh renders flat grey, matching
-                        # what TRAINING saw: precompute repairs ~97% of meshes, and
-                        # repair_mesh_watertight outputs a bare marching-cubes mesh with NO
-                        # material (ColorVisuals, no UVs), so TripoSR was trained on colorless
-                        # grey renders. Feeding it the raw TEXTURED asset at inference is a
-                        # domain shift in the DINO features. Set False to render the asset
-                        # with its real materials.
 OUTPUT_DIR     = "infer_output"
 AZIMUTH        = 0.0
 ELEVATION      = 30.0
@@ -572,386 +575,6 @@ def launch_three_way_viewer(
         app.launch(**launch_kwargs)
 
 
-# ─── Interactive viewer (UI first, pipeline on demand) ────────────────────────
-
-_run_id = itertools.count()  # cache-busting suffix so the browser reloads meshes
-
-
-def launch_interactive(args) -> None:
-    """Open the Gradio UI IMMEDIATELY, then run the pipeline on demand.
-
-    Differs from run_inference in two ways the batch path can't offer:
-      • X/Y/Z sliders translate the normalized mesh BEFORE it is rendered, so you
-        can probe how sensitive TripoSR + the SDF head are to where the object
-        sits in frame (the render camera always looks at the world ORIGIN, so a
-        translated mesh really is off-centre in the input image).
-      • The work runs in a generator that yields after every stage, so the input
-        render, each mesh, and the metrics appear as they are produced instead
-        of after one long blocking call.
-
-    Models are loaded lazily on the first run and cached in ``_state``, so only
-    the first click pays the TripoSR/checkpoint load; slider tweaks after that
-    re-run just render -> triplane -> marching cubes.
-    """
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    cache_dir = str(output_dir / "objaverse_cache")
-    _state: dict = {}
-
-    def _resolve_mesh_path(uid_or_path: str) -> str:
-        uid_or_path = (uid_or_path or "").strip()
-        if not uid_or_path:
-            raise ValueError("Give an Objaverse UID or a local mesh path.")
-        if os.path.exists(os.path.expanduser(uid_or_path)):
-            return os.path.abspath(os.path.expanduser(uid_or_path))
-        return fetch_objaverse_glb(uid_or_path, cache_dir)
-
-    _mesh_cache: dict = {}
-
-    def _repair_on_the_fly(src_path: str, cache_path: Path, radius: float):
-        """Repair `src_path` now, mirroring precompute, and write-through to the cache.
-
-        Reproduces train_sdf_head.py's precompute order exactly (normalize ->
-        repair -> RE-normalize), because the voxel remesh shifts centroid and scale
-        slightly; skipping the second normalize would render a subtly different
-        object than training saw, which is the whole point of this toggle.
-
-        Uses REPAIR_VOXEL_RES / REPAIR_VOXEL_METHOD rather than trimesh's defaults —
-        the voxelizer default "subdivide" is what OOM-killed precompute.
-
-        Returns (mesh, note) or (None, note) so the caller can fall back to raw.
-        """
-        try:
-            raw = _load_trimesh(src_path)
-            mesh, _, _ = _normalize_mesh_copy(raw, radius)
-            del raw
-        except Exception as exc:
-            return None, f"could not load for repair ({exc}) — raw mesh"
-
-        if mesh.is_watertight:
-            return mesh, "already watertight (no repair needed)"
-
-        try:
-            repaired, method = repair_mesh_watertight(
-                mesh, voxel_res=REPAIR_VOXEL_RES, voxel_method=REPAIR_VOXEL_METHOD)
-        except Exception as exc:
-            return None, f"repair errored ({exc}) — raw mesh"
-        if repaired is None:
-            return None, f"repair failed ({method}) — raw mesh"
-
-        mesh, _, _ = _normalize_mesh_copy(repaired, radius)
-        del repaired
-
-        try:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            mesh.export(str(cache_path))
-            saved = "cached"
-        except Exception as exc:
-            saved = f"not cached ({exc})"
-        return mesh, f"repaired on the fly via {method} · {saved}"
-
-    def _prepare_mesh(uid_or_path, use_repaired, dx, dy, dz, radius: float = 0.87,
-                      greyscale: bool = False):
-        """Resolve source -> (optionally repaired) -> normalize -> apply offset.
-
-        Shared by the live preview and the full run so the image you preview is
-        byte-for-byte the image the pipeline consumes. ``radius`` is accepted for
-        symmetry but is genuinely unused by normalization (which is centroid
-        removal + unit-longest-edge scale), which is exactly why the preview can
-        render before the checkpoint has ever been loaded.
-        Returns (mesh_copy, note).
-        """
-        key = ((uid_or_path or "").strip(), bool(use_repaired))
-        if key not in _mesh_cache:
-            path = _resolve_mesh_path(uid_or_path)
-            note = ""
-            mesh_obj = None
-            if use_repaired:
-                cand = (Path(args.dataset_dir) / "mesh_cache"
-                        / Path(path).parent.name / "repaired.obj")
-                if cand.is_file():
-                    path, note = str(cand), "repaired mesh (as training rendered)"
-                else:
-                    # Cache miss: repair now instead of silently showing the raw mesh,
-                    # so the toggle always means what it says. The voxel remesh is
-                    # slow (seconds to tens of seconds) but only on the first miss —
-                    # the result is memoised here and written to mesh_cache/ for
-                    # later runs.
-                    print(f"[repair] no cached repaired.obj for {Path(path).parent.name} "
-                          f"— repairing now (voxel_res={REPAIR_VOXEL_RES}, "
-                          f"method={REPAIR_VOXEL_METHOD})...", flush=True)
-                    mesh_obj, note = _repair_on_the_fly(path, cand, radius)
-                    print(f"[repair] {note}", flush=True)
-            if mesh_obj is None:
-                mesh_obj = load_and_normalize_mesh(path, radius)
-            _mesh_cache[key] = (mesh_obj, note)
-            if len(_mesh_cache) > 8:                      # bound memory
-                _mesh_cache.pop(next(iter(_mesh_cache)))
-        base, note = _mesh_cache[key]
-        mesh = base.copy()
-        if greyscale:
-            # Drop visual/material entirely -> pyrender falls back to its default
-            # flat grey, which is byte-for-byte the situation repaired.obj is in
-            # (bare marching-cubes output, ColorVisuals, no material, no UVs).
-            mesh = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces, process=False)
-            note = (note + " · " if note else "") + "greyscale (matches training)"
-        if (dx, dy, dz) != (0.0, 0.0, 0.0):
-            mesh.apply_translation([float(dx), float(dy), float(dz)])
-        return mesh, note
-
-    def preview(uid_or_path, dx, dy, dz, azimuth, elevation, fov, use_repaired, greyscale):
-        """Cheap live render of EXACTLY the image Run will feed TripoSR.
-
-        Deliberately touches neither the checkpoint nor TripoSR — just mesh load
-        (cached) + pyrender — so dragging a slider stays responsive.
-        """
-        try:
-            mesh, note = _prepare_mesh(uid_or_path, use_repaired, dx, dy, dz,
-                                       greyscale=greyscale)
-            # Reuse a small ring of filenames: still busts the browser cache,
-            # without leaving a preview PNG behind for every slider nudge.
-            path = str(output_dir / f"_preview_{next(_run_id) % 8}.png")
-            render_mesh_to_image(mesh, elevation=elevation, fov=fov, size=args.size,
-                                 azimuth=azimuth, extrinsics_json_path=None).save(path)
-            c = ((mesh.bounds[0] + mesh.bounds[1]) / 2).round(3)
-            return path, (f"_preview_ — offset ({dx:+.2f}, {dy:+.2f}, {dz:+.2f}), "
-                          f"az {azimuth:.0f}° el {elevation:.0f}° fov {fov:.0f}°, "
-                          f"bbox centre {c.tolist()}"
-                          + (f" · {note}" if note else "")
-                          + "  →  press **Run** to reconstruct")
-        except Exception as e:
-            return gr.update(), f"⚠️ preview failed — {type(e).__name__}: {e}"
-
-    def _load_models():
-        """Load checkpoint + LoRA-adapted TripoSR once, then reuse."""
-        if "sdf_mlp" in _state:
-            return
-        sdf_mlp, meta, saved_args = load_sdf_mlp_from_checkpoint(args.checkpoint, device)
-        from tsr.system import TSR
-        triposr = TSR.from_pretrained(args.model, config_name="config.yaml",
-                                      weight_name="model.ckpt")
-        triposr.renderer.set_chunk_size(8192)
-        triposr.to(device).eval()
-        for p in triposr.parameters():
-            p.requires_grad_(False)
-        is_ft = apply_finetuned_lora(triposr, args.checkpoint, device)
-        _state.update(sdf_mlp=sdf_mlp, meta=meta, saved_args=saved_args,
-                      triposr=triposr, is_finetuned=is_ft)
-
-    def run(uid_or_path, dx, dy, dz, azimuth, elevation, fov, mc_res,
-            use_repaired, greyscale, hide_nerf=False, progress=gr.Progress()):
-        """Generator: yields (status, input_img, gt, nerf, sdf, overlay, metrics)."""
-        rid = next(_run_id)
-        run_dir = output_dir / f"run_{rid:04d}"
-        run_dir.mkdir(parents=True, exist_ok=True)
-        log: list[str] = []
-        NO = gr.update()
-
-        def emit(msg, **kw):
-            log.append(msg)
-            return ("\n".join(f"- {m}" for m in log),
-                    kw.get("img", NO), kw.get("gt", NO), kw.get("nerf", NO),
-                    kw.get("sdf", NO), kw.get("ovl", NO), kw.get("met", NO))
-
-        try:
-            t0 = time.perf_counter()
-            progress(0.05, desc="Loading model")
-            yield emit("**Loading** SDF checkpoint + fine-tuned TripoSR…")
-            _load_models()
-            sdf_mlp, meta = _state["sdf_mlp"], _state["meta"]
-            sargs, triposr = _state["saved_args"], _state["triposr"]
-            radius = float(meta["radius"])
-            feat_red = meta["feature_reduction"]
-            n_freqs = int(getattr(sargs, "n_freqs", 0))
-            use_trip = bool(getattr(sargs, "use_triplane_features", True))
-            yield emit(f"Model ready ({'FINE-TUNED' if _state['is_finetuned'] else 'STOCK'} "
-                       f"TripoSR, radius={radius}) — {time.perf_counter()-t0:.1f}s")
-
-            progress(0.2, desc="Loading mesh")
-            # SAME helper the live preview uses, so the image you previewed is
-            # exactly the image reconstructed here.
-            gt_mesh, note = _prepare_mesh(uid_or_path, use_repaired, dx, dy, dz, radius,
-                                          greyscale=greyscale)
-            if note:
-                log.append(note.capitalize())
-            gt_path = str(run_dir / "source_mesh.obj")
-            gt_mesh.export(gt_path)
-            ctr = ((gt_mesh.bounds[0] + gt_mesh.bounds[1]) / 2).round(4)
-            yield emit(f"Mesh loaded ({len(gt_mesh.faces):,} faces), offset "
-                       f"({dx:+.2f}, {dy:+.2f}, {dz:+.2f}) → bbox centre {ctr.tolist()}",
-                       gt=gt_path)
-
-            progress(0.35, desc="Rendering input")
-            render_path = str(run_dir / "input_render.png")
-            pil = render_mesh_to_image(gt_mesh, elevation=elevation, fov=fov,
-                                       size=args.size, azimuth=azimuth,
-                                       extrinsics_json_path=str(run_dir / "camera_extrinsics.json"))
-            pil.save(render_path)
-            image_np = np.array(Image.open(render_path).convert("RGB"))
-            R_np = load_R_world_from_recon_json(run_dir)
-            yield emit("Input image rendered (camera looks at the **world origin**, "
-                       "so the offset moves the object within the frame).", img=render_path)
-
-            progress(0.5, desc="TripoSR forward")
-            with torch.no_grad():
-                triplane = triposr([image_np], device=device)[0].float()
-                with stock_triposr(triposr):
-                    triplane_stock = triposr([image_np], device=device)[0].float()
-            d = (triplane - triplane_stock).abs().mean().item()
-            yield emit(f"Triplane {tuple(triplane.shape)} extracted "
-                       f"(fine-tuned vs stock mean|Δ|={d:.4f})")
-
-            progress(0.65, desc="SDF marching cubes")
-            sdf_mesh = reconstruct_mesh_from_triplane(
-                sdf_mlp, triplane, radius, feat_red, resolution=int(mc_res),
-                device=device, n_freqs=n_freqs, R_world_from_trip=R_np,
-                use_triplane_features=use_trip)
-            sdf_path = None
-            if sdf_mesh is None:
-                yield emit("⚠️ SDF MLP: marching cubes found **no zero crossing**.")
-            else:
-                sdf_path = str(run_dir / "sdf_mlp_mesh.obj")
-                sdf_mesh.export(sdf_path)
-                yield emit(f"SDF MLP mesh: {len(sdf_mesh.faces):,} faces, "
-                           f"max extent {sdf_mesh.extents.max():.3f} "
-                           f"(GT {gt_mesh.extents.max():.3f})", sdf=sdf_path)
-
-            nerf_mesh = None
-            nerf_path = None
-            if hide_nerf:
-                # Skip the decode outright rather than computing and hiding it: the
-                # NeRF marching cubes is a full mc_res^3 grid evaluation, so this is
-                # the most expensive stage to leave running for output nobody sees.
-                yield emit("NeRF baseline **hidden** — decode skipped.")
-            else:
-                progress(0.8, desc="NeRF marching cubes")
-                nerf_mesh = reconstruct_mesh_nerf_decoder(
-                    triposr.decoder, triplane_stock, radius, feat_red,
-                    triposr.renderer.cfg.density_activation,
-                    float(triposr.renderer.cfg.density_bias),
-                    resolution=int(mc_res), threshold=args.nerf_threshold,
-                    device=device, R_world_from_trip=R_np)
-                if nerf_mesh is not None:
-                    nerf_path = str(run_dir / "nerf_decoder_mesh.obj")
-                    nerf_mesh.export(nerf_path)
-                    yield emit(f"NeRF baseline (**stock** TripoSR): {len(nerf_mesh.faces):,} faces",
-                               nerf=nerf_path)
-                else:
-                    yield emit("⚠️ NeRF decoder: no surface found.")
-
-            ovl = None
-            if sdf_mesh is not None:
-                ovl = str(run_dir / "overlay.glb")
-                # nerf_mesh is None when hidden; _combined_three_way_overlay already
-                # treats None as "omit that geometry", so the overlay is GT + SDF only.
-                _combined_three_way_overlay(gt_mesh, nerf_mesh, sdf_mesh, ovl)
-                yield emit("Overlay built (blue GT · orange SDF)." if hide_nerf else
-                           "Overlay built (blue GT · green NeRF · orange SDF).", ovl=ovl)
-
-            progress(0.92, desc="Metrics")
-            met = "_no SDF mesh — metrics skipped_"
-            if sdf_mesh is not None:
-                mm = compute_pointwise_sdf_mse(
-                    sdf_mlp, triplane, gt_mesh, radius, feat_red, R_np, n_freqs,
-                    use_trip, device, n_points=args.mse_points, sdf_clamp=args.sdf_clamp,
-                    near_surface_threshold=args.near_surface_threshold,
-                    near_surface_ratio=args.near_surface_ratio,
-                    near_surface_sigma=args.near_surface_sigma)
-                sm = mesh_surface_metrics(gt_mesh, sdf_mesh)
-                met = (f"| metric | value |\n|:--|--:|\n"
-                       f"| SDF MSE (raw) | `{mm['mse']:.6f}` |\n"
-                       f"| SDF MSE (clamp ±{mm['sdf_clamp']}) | `{mm['mse_clamped']:.6f}` |\n"
-                       f"| Chamfer-L2 | `{sm['chamfer']:.6f}` |\n"
-                       f"| F-score@0.01 | `{sm['fscore']:.3f}` |\n"
-                       f"| scale vs GT | `{sdf_mesh.extents.max()/gt_mesh.extents.max():.3f}×` |\n\n"
-                       + ("" if mm["rotation_aligned"] else "⚠️ not rotation-aligned"))
-            progress(1.0, desc="Done")
-            yield emit(f"**Done** in {time.perf_counter()-t0:.1f}s.", met=met)
-
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            yield emit(f"❌ **{type(e).__name__}**: {e}")
-
-    default_src = args.uid or args.mesh or (
-        "" if args.uid_index is None else uid_from_index(args.uid_index))
-
-    with gr.Blocks(title="SDF Inference — interactive") as app:
-        gr.Markdown(
-            "# SDF Inference — interactive\n"
-            "Move the object with the X/Y/Z sliders **before** it is rendered and fed to "
-            "TripoSR. The render camera always points at the world origin, so an offset "
-            "genuinely shifts the object in frame. Press **Run** to (re)compute; each "
-            "stage appears as it finishes."
-        )
-        with gr.Row():
-            src = gr.Textbox(value=default_src, label="Objaverse UID or local mesh path", scale=3)
-            run_btn = gr.Button("▶ Run", variant="primary", scale=1)
-        with gr.Row():
-            sx = gr.Slider(-1.0, 1.0, 0.0, step=0.01, label="offset X")
-            sy = gr.Slider(-1.0, 1.0, 0.0, step=0.01, label="offset Y")
-            sz = gr.Slider(-1.0, 1.0, 0.0, step=0.01, label="offset Z")
-        with gr.Row():
-            az = gr.Slider(0, 360, args.azimuth, step=1, label="azimuth°")
-            el = gr.Slider(-89, 89, args.elevation, step=1, label="elevation°")
-            fov = gr.Slider(10, 90, args.fov, step=1, label="fov°")
-            mcr = gr.Slider(32, 256, args.mc_resolution, step=32, label="MC resolution")
-        with gr.Row():
-            rep = gr.Checkbox(
-                value=False,
-                label="Use repaired mesh (what training actually rendered; ~97% of objects)")
-            grey = gr.Checkbox(
-                value=True,
-                label="Greyscale / colorless (matches training: repair strips all materials)")
-            hide_nerf = gr.Checkbox(
-                value=False,
-                label="Hide NeRF baseline (skips its decode; overlay shows GT + SDF only)")
-
-        status = gr.Markdown("_idle — press Run_")
-        with gr.Row():
-            img_o = gr.Image(label="TripoSR input image (live preview)", interactive=False)
-            met_o = gr.Markdown("_metrics_")
-        with gr.Row():
-            gt_o = gr.Model3D(label="GT (offset applied)", clear_color=[1, 1, 1, 1], height=300)
-            nerf_o = gr.Model3D(label="NeRF — stock TripoSR", clear_color=[1, 1, 1, 1], height=300)
-            sdf_o = gr.Model3D(label="SDF MLP", clear_color=[1, 1, 1, 1], height=300)
-        ovl_o = gr.Model3D(label="Overlay — blue GT · green NeRF · orange SDF "
-                                 "(NeRF omitted when hidden)",
-                           clear_color=[1, 1, 1, 1], height=380)
-
-        # Toggling only changes the pane's visibility, so it applies immediately
-        # without needing a re-run; the next Run also skips the decode.
-        hide_nerf.change(lambda h: gr.update(visible=not h),
-                         inputs=hide_nerf, outputs=nerf_o)
-
-        run_btn.click(run,
-                      inputs=[src, sx, sy, sz, az, el, fov, mcr, rep, grey, hide_nerf],
-                      outputs=[status, img_o, gt_o, nerf_o, sdf_o, ovl_o, met_o])
-
-        # ── Live preview of the exact image Run will send to TripoSR ──────────
-        # Bound to .release() (not .change()) so dragging a slider renders once
-        # on drop instead of on every intermediate pixel. Cheap by design: mesh
-        # is cached and neither the checkpoint nor TripoSR is touched.
-        _prev_in = [src, sx, sy, sz, az, el, fov, rep, grey]
-        _prev_out = [img_o, status]
-        for _c in (sx, sy, sz, az, el, fov):
-            _c.release(preview, inputs=_prev_in, outputs=_prev_out)
-        src.submit(preview, inputs=_prev_in, outputs=_prev_out)
-        rep.change(preview, inputs=_prev_in, outputs=_prev_out)
-        grey.change(preview, inputs=_prev_in, outputs=_prev_out)
-        # Render one immediately on page load so there is something to look at
-        # before touching anything.
-        app.load(preview, inputs=_prev_in, outputs=_prev_out)
-
-    launch_kwargs = dict(server_name="0.0.0.0" if args.listen else "localhost",
-                         server_port=args.port, share=args.share)
-    try:
-        app.launch(allowed_paths=[str(output_dir)], **launch_kwargs)
-    except TypeError:
-        app.launch(**launch_kwargs)
-
-
 # ─── Main inference pipeline ──────────────────────────────────────────────────
 
 def run_inference(args: argparse.Namespace) -> None:
@@ -1004,11 +627,6 @@ def run_inference(args: argparse.Namespace) -> None:
 
     _t = time.perf_counter()
     mesh = load_and_normalize_mesh(mesh_path, radius)
-    if getattr(args, "greyscale", False):
-        # Match training: repaired meshes carry no material, so TripoSR was
-        # trained on flat-grey renders (see GREYSCALE).
-        mesh = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces, process=False)
-        print("[mesh] greyscale/colorless (matches training render conditions)")
     source_obj_path = str(output_dir / "source_mesh.obj")
     mesh.export(source_obj_path)
     timing["Mesh load & normalize"] = time.perf_counter() - _t
@@ -1269,21 +887,6 @@ def main() -> None:
         help="Pass 2: Gaussian noise std used to jitter reseeded near-surface points.",
     )
     parser.add_argument(
-        "--no-greyscale", dest="greyscale", action="store_const", const=False, default=None,
-        help="Render the asset with its real materials/textures instead of flat grey. "
-             "Note training rendered repaired (material-less) meshes for ~97% of objects, "
-             "so colored input is a domain shift for the DINO features.",
-    )
-    parser.add_argument(
-        "--dataset-dir", default=None,
-        help="Training dataset dir; used only to find cached repaired.obj meshes.",
-    )
-    parser.add_argument(
-        "--no-interactive", dest="interactive", action="store_const", const=False, default=None,
-        help="Run the old batch pipeline (compute everything, then open the viewer) "
-             "instead of the interactive UI-first app.",
-    )
-    parser.add_argument(
         "--port", type=int, default=None,
         help="Gradio viewer port.",
     )
@@ -1325,9 +928,6 @@ def main() -> None:
     args.near_surface_threshold = _dflt(args.near_surface_threshold, NEAR_SURFACE_THRESHOLD)
     args.near_surface_ratio     = _dflt(args.near_surface_ratio, NEAR_SURFACE_RATIO)
     args.near_surface_sigma     = _dflt(args.near_surface_sigma, NEAR_SURFACE_SIGMA)
-    args.dataset_dir = _dflt(args.dataset_dir, DATASET_DIR)
-    args.greyscale   = _dflt(args.greyscale, GREYSCALE)
-    args.interactive = _dflt(args.interactive, INTERACTIVE)
     args.port    = _dflt(args.port, PORT)
     args.listen  = args.listen or LISTEN
     args.share   = args.share or SHARE
@@ -1338,10 +938,7 @@ def main() -> None:
             "UID / UID_INDEX / MESH in the CONFIGURATION block at the top of this file."
         )
 
-    if args.interactive:
-        launch_interactive(args)
-    else:
-        run_inference(args)
+    run_inference(args)
 
 
 if __name__ == "__main__":

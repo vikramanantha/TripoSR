@@ -192,20 +192,26 @@ def _combined_overlay_with_axes(
     show_recon: bool = True,
     recon_R_world_from_recon: np.ndarray | None = None,
     normalize_source_to_unit_cube: bool = True,
+    sdf_mesh_path: str | None = None,
+    show_sdf: bool = True,
 ) -> str:
     """
-    Single scene: optional source + optional reconstruction.
+    Single scene: optional source + reconstruction (NeRF) + fine-tuned SDF mesh.
 
     **Source (blue):** unit AABB (bbox center at origin, longest edge = 1) in pyrender
     world. If ``recon_R_world_from_recon`` (``R`` from ``camera_extrinsics.json``) is
     set, then ``p' = Rᵀ @ p`` is applied so the source sits in TripoSR’s recon-like
     frame while the recon mesh is left unrotated.
 
-    **Recon (orange):** TripoSR export only — no rotation, no rescaling, no translation
-    beyond what the file contains.
+    **Recon (orange):** stock-NeRF TripoSR export — no rotation/rescale/translation.
+
+    **SDF (green):** fine-tuned LoRA-TripoSR + SDF-head export, same native triplane
+    frame as the NeRF recon — also left unrotated.
     """
     source = _load_trimesh(source_mesh_path)
     recon = _load_trimesh(recon_mesh_path)
+    sdf_mesh = (_load_trimesh(sdf_mesh_path)
+                if sdf_mesh_path and os.path.exists(sdf_mesh_path) else None)
 
     source_extent = float(np.max(source.extents)) if source.extents.size else 0.0
     recon_extent = float(np.max(recon.extents)) if recon.extents.size else 0.0
@@ -234,8 +240,13 @@ def _combined_overlay_with_axes(
     else:
         print("[overlay] source: unit cube only (no Rᵀ — missing camera_extrinsics.json)")
     print("[overlay] reconstruction: unchanged from TripoSR export (no rotation)")
+    if sdf_mesh is not None:
+        print("[overlay] sdf mesh: unchanged from SDF-head export (no rotation)")
 
-    bounds = np.stack([source.bounds, recon.bounds], axis=0)
+    _bounds_list = [source.bounds, recon.bounds]
+    if sdf_mesh is not None:
+        _bounds_list.append(sdf_mesh.bounds)
+    bounds = np.stack(_bounds_list, axis=0)
     combined_min = bounds[:, 0, :].min(axis=0)
     combined_max = bounds[:, 1, :].max(axis=0)
     extents_union = combined_max - combined_min
@@ -263,6 +274,11 @@ def _combined_overlay_with_axes(
             _copy_mesh_solid_color(recon, [255, 120, 60, 220]),
             geom_name="reconstruction",
         )
+    if show_sdf and sdf_mesh is not None:
+        scene.add_geometry(
+            _copy_mesh_solid_color(sdf_mesh, [60, 200, 120, 220]),
+            geom_name="sdf",
+        )
     scene.add_geometry(axes, geom_name="axes")
     scene.add_geometry(grid, geom_name="grid")
 
@@ -277,6 +293,8 @@ def build_viewer(
     render_image_path: str | None = None,
     output_dir: str | None = None,
     camera_extrinsics_path: str | None = None,
+    sdf_mesh_path: str | None = None,
+    metrics_md: str | None = None,
 ) -> gr.Blocks:
     mesh_name = os.path.basename(mesh_path)
     compare_mode = source_mesh_path is not None
@@ -305,9 +323,18 @@ def build_viewer(
             mesh_path,
             os.path.join(vis_dir, "overlay_both_meshes.glb"),
             recon_R_world_from_recon=recon_R,
+            sdf_mesh_path=sdf_mesh_path,
         )
     else:
         overlay_path = None
+
+    # Optional fine-tuned SDF-head reconstruction (LoRA TripoSR + SDF MLP).
+    sdf_axes_path = None
+    if sdf_mesh_path and os.path.exists(sdf_mesh_path):
+        sdf_axes_path = _mesh_with_axes(
+            sdf_mesh_path,
+            os.path.join(vis_dir, "sdf_with_axes.glb"),
+        )
 
     with gr.Blocks(title=f"Mesh Viewer - {mesh_name}") as app:
         intro = (
@@ -329,6 +356,8 @@ def build_viewer(
                 + " Use the checkboxes to show or hide each mesh."
             )
         gr.Markdown(intro)
+        if metrics_md:
+            gr.Markdown(metrics_md)
         with gr.Row(equal_height=True):
             if compare_mode and source_axes_path:
                 gr.Model3D(
@@ -340,11 +369,17 @@ def build_viewer(
                 value=recon_axes_path,
                 clear_color=[1.0, 1.0, 1.0, 1.0],
                 label=(
-                    "Reconstructed mesh + axes (drag to rotate, scroll to zoom)"
+                    "NeRF recon mesh + axes (stock TripoSR)"
                     if compare_mode
                     else "Mesh + axes (drag to rotate, scroll to zoom)"
                 ),
             )
+            if sdf_axes_path:
+                gr.Model3D(
+                    value=sdf_axes_path,
+                    clear_color=[1.0, 1.0, 1.0, 1.0],
+                    label="Fine-tuned SDF-head mesh + axes (LoRA TripoSR + SDF MLP)",
+                )
         with gr.Row():
             if render_image_path and os.path.exists(render_image_path):
                 gr.Image(
@@ -357,7 +392,7 @@ def build_viewer(
             if compare_mode and overlay_path:
                 overlay_glb_path = os.path.join(vis_dir, "overlay_both_meshes.glb")
 
-                def _refresh_overlay(show_src: bool, show_recon: bool):
+                def _refresh_overlay(show_src: bool, show_recon: bool, show_sdf: bool = True):
                     _combined_overlay_with_axes(
                         source_mesh_path,
                         mesh_path,
@@ -365,6 +400,8 @@ def build_viewer(
                         show_source=show_src,
                         show_recon=show_recon,
                         recon_R_world_from_recon=recon_R,
+                        sdf_mesh_path=sdf_mesh_path,
+                        show_sdf=show_sdf,
                     )
                     return gr.update(value=overlay_glb_path)
 
@@ -376,29 +413,34 @@ def build_viewer(
                         )
                         show_recon_cb = gr.Checkbox(
                             value=True,
-                            label="Show reconstruction (orange)",
+                            label="Show NeRF recon (orange)",
+                        )
+                        show_sdf_cb = (
+                            gr.Checkbox(value=True, label="Show SDF recon (green)")
+                            if sdf_axes_path else None
                         )
                     overlay_model = gr.Model3D(
                         value=overlay_path,
                         clear_color=[1.0, 1.0, 1.0, 1.0],
                         label="Overlay: same coordinates (toggle meshes above)",
                     )
-                    show_source_cb.change(
-                        _refresh_overlay,
-                        inputs=[show_source_cb, show_recon_cb],
-                        outputs=[overlay_model],
-                    )
-                    show_recon_cb.change(
-                        _refresh_overlay,
-                        inputs=[show_source_cb, show_recon_cb],
-                        outputs=[overlay_model],
-                    )
+                    _overlay_inputs = [show_source_cb, show_recon_cb]
+                    if show_sdf_cb is not None:
+                        _overlay_inputs.append(show_sdf_cb)
+                    for _cb in _overlay_inputs:
+                        _cb.change(
+                            _refresh_overlay,
+                            inputs=_overlay_inputs,
+                            outputs=[overlay_model],
+                        )
             elif not compare_mode:
                 gr.File(value=mesh_path, label="Download reconstructed mesh")
         if compare_mode:
             with gr.Row():
-                gr.File(value=mesh_path, label="Download reconstructed mesh")
+                gr.File(value=mesh_path, label="Download NeRF recon mesh")
                 gr.File(value=source_mesh_path, label="Download source mesh")
+                if sdf_axes_path:
+                    gr.File(value=sdf_mesh_path, label="Download SDF-head mesh")
 
     return app
 
@@ -412,6 +454,8 @@ def launch_viewer(
     listen: bool = False,
     share: bool = True,
     camera_extrinsics_path: str | None = None,
+    sdf_mesh_path: str | None = None,
+    metrics_md: str | None = None,
 ) -> None:
     app = build_viewer(
         mesh_path=mesh_path,
@@ -419,6 +463,8 @@ def launch_viewer(
         render_image_path=render_image_path,
         output_dir=output_dir,
         camera_extrinsics_path=camera_extrinsics_path,
+        sdf_mesh_path=sdf_mesh_path,
+        metrics_md=metrics_md,
     )
     kwargs = {
         "server_name": "0.0.0.0" if listen else "localhost",
@@ -427,6 +473,8 @@ def launch_viewer(
     allowed_paths = [mesh_path, output_dir]
     if source_mesh_path:
         allowed_paths.append(source_mesh_path)
+    if sdf_mesh_path:
+        allowed_paths.append(sdf_mesh_path)
     if render_image_path:
         allowed_paths.append(render_image_path)
     if camera_extrinsics_path:

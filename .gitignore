@@ -171,3 +171,9 @@ wandb/
 features.pt
 
 infer_output/
+# SDFer robot-demo / terrain renders — regenerable outputs (GIFs, meshes, logs)
+robot_demo_output_v*/
+terrain_gif_output/
+
+# Scratch mirror of ../baselines into the docker mount (see baselines/run_sdfer_host.sh)
+.baselines_bridge/
