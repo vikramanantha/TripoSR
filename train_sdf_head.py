@@ -123,7 +123,7 @@ VERBOSE               = False
 # ── Train ────────────────────────────────────────────────────────────────────
 OUTPUT_DIR      = "/home/markiv/TripoSR/sdf_checkpoints"
 EPOCHS          = 500
-SAVE_EVERY      = 25
+SAVE_EVERY      = 10
 HIDDEN_DIM      = 128
 HIDDEN_DIM_NO_TRIPLANE = 256
 N_HIDDEN        = 6
