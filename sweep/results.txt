@@ -1,0 +1,9 @@
+S=4   mem=18324MiB steps 34->99 in 40s
+   0.615 s/step  0.1538 s/sample  epoch(6400/4/4 steps)=4.10 min
+S=6   mem=26218MiB steps 33->97 in 60s
+   0.938 s/step  0.1562 s/sample  epoch(6400/4/6 steps)=4.16 min
+S=8   mem=33902MiB steps 33->93 in 75s
+   1.250 s/step  0.1562 s/sample  epoch(6400/4/8 steps)=4.17 min
+S=10  mem=41770MiB steps 30->92 in 96s
+   1.548 s/step  0.1548 s/sample  epoch(6400/4/10 steps)=4.13 min
+S=12  FAILED (oom/no-start)

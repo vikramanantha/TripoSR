@@ -12,7 +12,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-PY_SCRIPT="$SCRIPT_DIR/train_sdf_head.py"
+PY_SCRIPT="$SCRIPT_DIR/train_sdf_head_fast.py"
 
 resolve_python() {
     if [[ -n "${TRAIN_SDF_PYTHON:-}" && -x "${TRAIN_SDF_PYTHON}" ]]; then
@@ -86,16 +86,37 @@ cd "$SCRIPT_DIR"
 prompt_precompute_restart() {
     local ds_dir samples_dir existing
     ds_dir=$("$PYTHON" - "$PY_SCRIPT" <<'PYEOF'
-import re, sys
+import re, sys, os
 src = open(sys.argv[1]).read()
-m = re.search(r'^DATASET_DIR\s*=\s*"([^"]+)"', src, re.M)
-print(m.group(1) if m else "")
+# DATASET_DIR is no longer a string literal - it is computed by
+# _resolve_ws_frb_root() so one file works on the host and in the container.
+# Exec just that config slice (only `os` is needed) and read the result; fall
+# back to the old literal regex for scripts that still hardcode a path.
+# Without this the regex silently returns "" and the existing-samples guard
+# below is skipped entirely.
+val = ""
+try:
+    i = src.index("_WS_FRB_ROOTS")
+    j = src.index("OUTPUT_DIR", i)
+    ns = {"os": os}
+    exec(src[i:j], ns)
+    val = ns.get("DATASET_DIR", "") or ""
+except Exception:
+    pass
+if not val:
+    m = re.search(r'^DATASET_DIR\s*=\s*"([^"]+)"', src, re.M)
+    val = m.group(1) if m else ""
+print(val)
 PYEOF
 )
     [[ -z "$ds_dir" ]] && return 0
     samples_dir="$ds_dir/samples"
     [[ -d "$samples_dir" ]] || return 0
-    existing=$(find "$samples_dir" -maxdepth 1 -mindepth 1 -not -name '_tmp*' | wc -l)
+    # readdir ONLY - do not use find here. find must know each entry's type, and
+    # NFSv3 readdir returns DT_UNKNOWN, so it issues one stat() per entry: measured
+    # 8+ minutes on 331k samples (and this dataset is headed for 1M) versus 0.58 s
+    # for ls -U. The count is the only thing needed, so never stat.
+    existing=$(ls -U "$samples_dir" 2>/dev/null | grep -v '^_tmp' | wc -l)
     [[ "$existing" -eq 0 ]] && return 0
     echo "Found $existing existing samples in $samples_dir."
     read -r -p "Delete all and restart? [y/N] " answer

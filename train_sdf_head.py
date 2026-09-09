@@ -16,6 +16,7 @@ Typical workflow
 """
 
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import gc
 import time
 from datetime import timedelta
@@ -61,7 +62,47 @@ from tsr.utils import get_activation, scale_tensor
 COMMAND = "both"
 
 # ── Shared ──────────────────────────────────────────────────────────────────
-DATASET_DIR     = "/home/markiv/TripoSR/sdf_dataset"
+# Precomputed data lives on the ws-frb NFS export (169 TB), NOT on the local
+# disk — the 33k-object dataset alone is 2.2 TB and local was down to 3% free.
+#
+# The SAME export is visible at TWO different paths depending on where this
+# runs: directly at /mnt/ws-frb on the host, and at /mnt/hostmnt/ws-frb inside
+# the training container, whose /mnt bind-mount re-roots the host's /mnt.
+# Resolve between them exactly the way objaverse_paths.py does for the shared
+# Objaverse mirror, so one file works in both places with no hand-editing.
+#
+# GOTCHA: a plain bind mount captures the host's mount tree as it was when the
+# container STARTED and does not pick up submounts added later. ws-frb was
+# mounted on the host after this container was created, so /mnt/hostmnt/ws-frb
+# was an empty placeholder until the container was restarted. If the resolver
+# below raises inside the container while the host clearly has it mounted, the
+# fix is `docker restart markiv` — not a path edit.
+_WS_FRB_ROOTS = ("/mnt/ws-frb", "/mnt/hostmnt/ws-frb")
+_PRECOMPUTED_REL = "users/markiv/sdfer/TripoSR/precomputed"
+
+
+def _resolve_ws_frb_root() -> str:
+    """First ws-frb path that is the REAL export, not a bare mountpoint dir.
+
+    Presence of ``users/`` is the discriminator: an unpropagated mountpoint
+    exists but is empty, so testing os.path.isdir(root) alone would happily
+    return a path that silently reads as an empty dataset."""
+    for _root in _WS_FRB_ROOTS:
+        if os.path.isdir(os.path.join(_root, "users")):
+            return _root
+    raise FileNotFoundError(
+        "ws-frb NFS export not found at " + " or ".join(_WS_FRB_ROOTS) + ". "
+        "Inside the training container /mnt is bind-mounted to /mnt/hostmnt and "
+        "only exposes host mounts that existed when the container STARTED — if "
+        "the host has it mounted, `docker restart markiv` will expose it. "
+        "Failing loudly rather than falling back to local disk on purpose: the "
+        "local volume does not have room for these datasets."
+    )
+
+
+DATASET_DIR     = os.path.join(_resolve_ws_frb_root(), _PRECOMPUTED_REL)
+# mesh_cache/ (downloaded + repaired meshes) is derived as DATASET_DIR/mesh_cache
+# in both run_precompute and run_train, so it follows automatically.
 
 # ── Precompute ───────────────────────────────────────────────────────────────
 MODEL                 = "stabilityai/TripoSR"
@@ -148,6 +189,7 @@ NORMAL_LOSS_WEIGHT    = 0.0   # surface-normal alignment loss weight (0 disables
                               # align ∇f with the GT SDF gradient direction at near-surface points.
                               # TEMPORARILY DISABLED (was 0.1) for debugging — restore to re-enable.
 NORMAL_LOSS_THRESHOLD = 0.05  # only points with |sdf_gt| < this get normal supervision
+DATASET_SCAN_THREADS = 32   # threads for SDFLazyDataset's per-sample NFS scan (env SDFER_SCAN_THREADS)
 NUM_WORKERS     = 4
 RUN_NAME        = "v0.64_10k"
 TEST_FRACTION   = 0.2        # fraction of meshes (UIDs) held out as unseen
@@ -1396,7 +1438,13 @@ class SDFPointDataset(Dataset):
     def __init__(self, dataset_dir: str, uid_whitelist: set | None = None,
                  sample_whitelist: set | None = None, cache_subdir: str = "_flat_cache"):
         root = Path(dataset_dir)
-        all_samples = sorted((root / "samples").glob("*/triplane.pt"))
+        # listdir, NOT glob("*/triplane.pt"): on the ~1M-dir NFS dataset the glob
+        # stats every entry (>120 s, measured) vs 1.4 s for a readdir. The atomic
+        # _tmp->final rename in precompute guarantees a final-named dir has its
+        # triplane.pt, so the listing is exactly equivalent.
+        all_samples = sorted(Path(root) / "samples" / _n / "triplane.pt"
+            for _n in os.listdir(Path(root) / "samples")
+            if not _n.startswith("_tmp"))
         if uid_whitelist is not None:
             all_samples = [p for p in all_samples
                            if p.parent.name.split("_az")[0] in uid_whitelist]
@@ -1562,7 +1610,13 @@ class SDFLazyDataset(Dataset):
     def __init__(self, dataset_dir: str, uid_whitelist: set | None = None,
                  sample_whitelist: set | None = None):
         root = Path(dataset_dir)
-        all_samples = sorted((root / "samples").glob("*/triplane.pt"))
+        # listdir, NOT glob("*/triplane.pt"): on the ~1M-dir NFS dataset the glob
+        # stats every entry (>120 s, measured) vs 1.4 s for a readdir. The atomic
+        # _tmp->final rename in precompute guarantees a final-named dir has its
+        # triplane.pt, so the listing is exactly equivalent.
+        all_samples = sorted(Path(root) / "samples" / _n / "triplane.pt"
+            for _n in os.listdir(Path(root) / "samples")
+            if not _n.startswith("_tmp"))
         if uid_whitelist is not None:
             all_samples = [p for p in all_samples
                            if p.parent.name.split("_az")[0] in uid_whitelist]
@@ -1578,11 +1632,24 @@ class SDFLazyDataset(Dataset):
         self.radius: float = float(self.meta["radius"])
         self.feature_reduction: str = self.meta["feature_reduction"]
         self.sample_dirs: list[Path] = [p.parent for p in all_samples]
-        self.R_list: list[np.ndarray] = [
-            load_R_world_from_recon_json_strict(d) for d in self.sample_dirs
-        ]
+        # ONE parallel pass for the three per-sample NFS checks (extrinsics json,
+        # input_image.png, image_tokens.pt). These used to be three sequential
+        # sweeps of ~4 round-trips per sample; on the 1M-sample NFS dataset with
+        # 4 DDP ranks contending that measured ~100 samples/s, i.e. ~2 HOURS of
+        # startup per launch before a single training step. NFS I/O releases the
+        # GIL, so a thread pool turns it into a few seconds. Semantics are
+        # unchanged: same strict loader (exceptions propagate through map), same
+        # order, same missing/has_cached_tokens results.
+        def _scan(d: Path):
+            return (load_R_world_from_recon_json_strict(d),
+                    (d / "input_image.png").exists(),
+                    (d / "image_tokens.pt").exists())
+        _threads = int(os.environ.get("SDFER_SCAN_THREADS", DATASET_SCAN_THREADS))
+        with ThreadPoolExecutor(max_workers=_threads) as _ex:
+            _scanned = list(_ex.map(_scan, self.sample_dirs, chunksize=256))
+        self.R_list: list[np.ndarray] = [r for r, _, _ in _scanned]
 
-        missing = [d for d in self.sample_dirs if not (d / "input_image.png").exists()]
+        missing = [d for d, (_, _img_ok, _) in zip(self.sample_dirs, _scanned) if not _img_ok]
         if missing:
             raise RuntimeError(
                 f"{len(missing)} sample(s) are missing input_image.png "
@@ -1594,9 +1661,7 @@ class SDFLazyDataset(Dataset):
         # branches on this ONCE per outer step rather than handling a mixed
         # batch, so a partially-upgraded dataset falls back to the slow path
         # entirely until fully re-precomputed.
-        self.has_cached_tokens: bool = all(
-            (d / "image_tokens.pt").exists() for d in self.sample_dirs
-        )
+        self.has_cached_tokens: bool = all(_tok for _, _, _tok in _scanned)
 
     def __len__(self) -> int:
         return len(self.sample_dirs)
@@ -2146,7 +2211,13 @@ def run_train(args: argparse.Namespace) -> None:
                                                float(radius), feature_reduction)
         return feats, pts_trip
 
-    all_sample_paths = sorted((dataset_dir / "samples").glob("*/triplane.pt"))
+    # listdir, NOT glob("*/triplane.pt"): on the ~1M-dir NFS dataset the glob
+    # stats every entry (>120 s, measured) vs 1.4 s for a readdir. The atomic
+    # _tmp->final rename in precompute guarantees a final-named dir has its
+    # triplane.pt, so the listing is exactly equivalent.
+    all_sample_paths = sorted(Path(dataset_dir) / "samples" / _n / "triplane.pt"
+        for _n in os.listdir(Path(dataset_dir) / "samples")
+        if not _n.startswith("_tmp"))
     all_uids = sorted({p.parent.name.split("_az")[0] for p in all_sample_paths})
 
     # Cap to n_objects and azimuths_per_mesh (mirrors precompute behaviour)

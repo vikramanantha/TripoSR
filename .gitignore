@@ -177,3 +177,4 @@ terrain_gif_output/
 
 # Scratch mirror of ../baselines into the docker mount (see baselines/run_sdfer_host.sh)
 .baselines_bridge/
+.baselines_bridge_hy3d/
