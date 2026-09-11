@@ -112,7 +112,6 @@ from train_sdf_head import (
     SDFLazyDataset,
     apply_lora_to_triposr,
     fourier_encode,
-    sign_bce_loss,
     surface_weighted_mse_loss,
     surface_weighted_se,
     triposr_forward_from_cached_tokens,
@@ -154,10 +153,13 @@ def _resolve_ws_frb_root() -> str:
     )
 
 
-DATASET_DIR     = os.path.join(_resolve_ws_frb_root(),
-                               "users/markiv/sdfer/TripoSR/precomputed")
+# SDFER_DATASET_DIR (absolute) overrides the dataset location; the ablation
+# study's no-near-sampling overlay lives on local disk at a path that is
+# identical on the host and in the container.
+DATASET_DIR     = os.environ.get("SDFER_DATASET_DIR") or os.path.join(
+                      _resolve_ws_frb_root(), "users/markiv/sdfer/TripoSR/precomputed")
 OUTPUT_DIR      = "/home/markiv/TripoSR/sdf_checkpoints"
-RUN_NAME        = "v0.67_100k"   # warm start from v0.64_10k ep50 (best live head, see prof/compare_ckpts.py)
+RUN_NAME        = "v0.69_100k"   # v0.69: finite-difference eikonal + normal loss (see fd_gradient_terms)
 MODEL           = "stabilityai/TripoSR"
 
 # ── Scale / schedule ─────────────────────────────────────────────────────────
@@ -186,7 +188,7 @@ EVAL_POINT_CHUNK        = 131072 # points per MLP forward during eval (no_grad).
 # down for margin; sqrt not linear because AdamW normalizes by the gradient's
 # second moment). AUTO_SCALE_LR then sqrt-scales from this reference to the
 # ACTUAL pool (262,144 by default -> lr ~7.1e-3).
-LR              = 5e-3
+LR              = 1e-3   # v0.68: was 5e-3 (x sqrt-scale = 7.07e-3 peak drove the collapse)
 LR_REF_POINTS   = 131072
 # LoRA optimizer semantics are unchanged (accumulate over the pool, step once);
 # committed v0.64 used 1e-4 at a 131,072-pt pool with S=4. S=8 halves the
@@ -194,16 +196,25 @@ LR_REF_POINTS   = 131072
 # ground in fewer steps (kept small — adapting a pretrained backbone is the
 # delicate half of this model), then sqrt-scaled with the pool like LR.
 LORA_LR         = 1.5e-4
-AUTO_SCALE_LR   = True
+AUTO_SCALE_LR   = False  # v0.68: was True
 LR_MIN          = 1e-5
 WEIGHT_DECAY    = 1e-4
 LORA_WEIGHT_DECAY = 1e-4
 GRAD_CLIP       = 1.0
-LOSS_REJECT_K   = 3.0
+LOSS_REJECT_K   = 0.0    # v0.68: was 3.0 — rejection OFF (it dropped wrong-sign inside pts 4x more)
 USE_ONECYCLE    = True
 ONECYCLE_PCT_START = 0.1
 
-EIKONAL_WEIGHT        = 1e-3
+EIKONAL_WEIGHT        = 1e-3  # NOT re-tuned: all prior eikonal tuning was on the no-op PE-only term
+EIKONAL_MODE          = "fd"  # "fd" = central finite differences through grid_sample AND the MLP
+                              #        (Neuralangelo Sec. 3.2; covers the triplane branch, no double
+                              #        backward needed); "autograd_pe" = old PE-only autograd path,
+                              #        which measured cos 0.36 to the true gradient, i.e. a no-op.
+EIKONAL_FD_EPS_START  = 0.01  # FD step, annealed exponentially to EPS_END over total_steps
+EIKONAL_FD_EPS_END    = 0.002 # triplane cell = 2*0.87/64 = 0.027 -> start = cell/3, end = cell/13
+EIKONAL_FD_POINTS     = 4096  # band points per sample the FD gradient is evaluated on (x6 forwards)
+EIKONAL_BAND_ONLY     = True  # only |gt| < SDF_CLAMP: beyond it the clamped target is flat, so
+                              # ||grad f|| = 1 is the wrong constraint (71% of points)
 EIKONAL_FRACTION      = 0.25  # fraction of the pool the eikonal term is evaluated on, each step a
                               # fresh random subset. The eikonal needs a create_graph double-backward
                               # through the MLP, measured at 96 ms of the MLP step's 129 ms (grid_sample's
@@ -214,10 +225,12 @@ EIKONAL_FRACTION      = 0.25  # fraction of the pool the eikonal term is evaluat
                               # gradients at near-surface points across the whole pool).
 SIGN_BCE_WEIGHT       = 0.1
 SIGN_BCE_ALPHA        = 20.0
-SIGN_BCE_EPSILON      = 0.02
+SIGN_BCE_EPSILON      = 0.005  # v0.68: was 0.02 (excluded 95% of all inside points)
+SIGN_BCE_BALANCED     = True   # v0.68 NEW: inside class weighted n_out/n_in per pool (cap 100x)
+SIGN_BCE_CLAMP_LOGITS = True   # v0.68 NEW: BCE logits from pred clamped to +-SDF_CLAMP
 SURFACE_LOSS_SIGMA    = 0.05
-SDF_CLAMP             = 0.1
-NORMAL_LOSS_WEIGHT    = 0.0
+SDF_CLAMP             = 0.1    # v0.68: now clamps the TARGET only (see sdf_loss_terms)
+NORMAL_LOSS_WEIGHT    = 1e-3  # v0.69: ON, same FD gradient vs normal_gt.pt; 0.0 for a single-variable run
 NORMAL_LOSS_THRESHOLD = 0.05
 
 # ── Model (identical architecture to train_sdf_head.py) ──────────────────────
@@ -316,8 +329,7 @@ class FastSDFDataset(SDFLazyDataset):
     def __init__(self, dataset_dir: str, uid_whitelist: set | None = None,
                  sample_whitelist: set | None = None, n_points_out: int = 0,
                  deterministic_subsample: bool = False):
-        super().__init__(dataset_dir, uid_whitelist=uid_whitelist,
-                         sample_whitelist=sample_whitelist)
+        self._init_with_scan_cache(dataset_dir, uid_whitelist, sample_whitelist)
         n_in = int(self.meta["n_points"])
         self.n_points_in = n_in
         self.n_points_out = n_in if n_points_out <= 0 else min(int(n_points_out), n_in)
@@ -337,6 +349,85 @@ class FastSDFDataset(SDFLazyDataset):
                 k_unif = self.n_points_out - k_near
                 if 0 <= k_unif <= n_unif and 0 <= k_near <= n_near:
                     self._blocks = [(0, n_unif, k_unif), (n_unif, n_in, k_near)]
+
+    def _init_with_scan_cache(self, dataset_dir: str, uid_whitelist, sample_whitelist) -> None:
+        """SDFLazyDataset.__init__ with the per-sample NFS scan CACHED on local disk.
+
+        The base scan does ~3 NFS round-trips per sample (extrinsics json read,
+        two stats) = ~200k ops for a 10k-object split. Measured 2026-09-09 on
+        giratina: ws-frb serves ~185 metadata ops/s with 128 outstanding, so
+        four concurrent runs starting up sat in D-state for 2+ hours without a
+        single training step and starved everything else on the export. The
+        scan result is a pure function of the sample list, so it is computed
+        once and stored under SDFER_SCAN_CACHE_DIR (default
+        /home/markiv/data/scan_cache, local NVMe, same path in docker), keyed by
+        dataset path + sample names. Semantics on a cache miss are identical to
+        the base class (same strict R loader, same missing-image error, same
+        dataset-wide has_cached_tokens flag)."""
+        import hashlib
+        import json
+        from concurrent.futures import ThreadPoolExecutor
+        root = Path(dataset_dir)
+        all_samples = sorted(Path(root) / "samples" / _n / "triplane.pt"
+            for _n in os.listdir(Path(root) / "samples")
+            if not _n.startswith("_tmp"))
+        if uid_whitelist is not None:
+            all_samples = [p for p in all_samples
+                           if p.parent.name.split("_az")[0] in uid_whitelist]
+        if sample_whitelist is not None:
+            all_samples = [p for p in all_samples
+                           if p.parent.name in sample_whitelist]
+        if not all_samples:
+            raise RuntimeError(f"No precomputed samples found under {root}/samples/")
+        with open(root / "metadata.json") as f:
+            self.meta: dict = json.load(f)
+        self.radius: float = float(self.meta["radius"])
+        self.feature_reduction: str = self.meta["feature_reduction"]
+        self.sample_dirs: list[Path] = [p.parent for p in all_samples]
+        names = [d.name for d in self.sample_dirs]
+
+        cache_root = os.environ.get("SDFER_SCAN_CACHE_DIR", "/home/markiv/data/scan_cache")
+        if not os.path.isdir(cache_root):
+            cache_root = str(root / "_scan_cache")
+        key = hashlib.sha1((str(root) + "\n" + "\n".join(names)).encode()).hexdigest()[:16]
+        cache_file = Path(cache_root) / f"scan_{key}.npz"
+        if cache_file.is_file():
+            try:
+                z = np.load(cache_file, allow_pickle=False)
+                if z["names"].tolist() == names:
+                    self.R_list = [r for r in z["R"].astype(np.float64)]
+                    self.has_cached_tokens = bool(z["has_cached_tokens"])
+                    print(f"[scan-cache] {len(names)} samples from {cache_file}", flush=True)
+                    return
+            except Exception as e:  # noqa: BLE001 — fall through to a real scan
+                print(f"[scan-cache] unreadable ({e}); rescanning")
+
+        def _scan(d: Path):
+            return (base.load_R_world_from_recon_json_strict(d),
+                    (d / "input_image.png").exists(),
+                    (d / "image_tokens.pt").exists())
+        _threads = int(os.environ.get("SDFER_SCAN_THREADS", base.DATASET_SCAN_THREADS))
+        t0 = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=_threads) as _ex:
+            _scanned = list(_ex.map(_scan, self.sample_dirs, chunksize=256))
+        self.R_list = [r for r, _, _ in _scanned]
+        missing = [d for d, (_, _img_ok, _) in zip(self.sample_dirs, _scanned) if not _img_ok]
+        if missing:
+            raise RuntimeError(
+                f"{len(missing)} sample(s) are missing input_image.png "
+                f"(e.g. {missing[0].name}). Re-run precompute to regenerate.")
+        self.has_cached_tokens = all(_tok for _, _, _tok in _scanned)
+        print(f"[scan-cache] scanned {len(names)} samples in {time.perf_counter() - t0:.0f}s",
+              flush=True)
+        try:
+            Path(cache_root).mkdir(parents=True, exist_ok=True)
+            tmp = cache_file.with_suffix(f".tmp{os.getpid()}.npz")
+            np.savez(tmp, names=np.array(names), R=np.stack(self.R_list).astype(np.float32),
+                     has_cached_tokens=np.array(self.has_cached_tokens))
+            os.replace(tmp, cache_file)
+            print(f"[scan-cache] saved {cache_file}", flush=True)
+        except Exception as e:  # noqa: BLE001 — the cache is an optimization only
+            print(f"[scan-cache] could not save {cache_file}: {e}")
 
     def _subsample_idx(self, idx: int) -> torch.Tensor | None:
         if self.n_points_out >= self.n_points_in:
@@ -402,6 +493,121 @@ def query_triplane_features_batched(
         mode="bilinear",
     )                                                    # (S*3, C, 1, N)
     return rearrange(out, "(s p) c () n -> s n (p c)", p=3)
+
+
+def sign_bce_loss_v2(pred: torch.Tensor, target: torch.Tensor, alpha: float,
+                     epsilon: float, clamp: float, balanced: bool) -> torch.Tensor:
+    """Sign-classification BCE (label 1 = outside), v0.68 semantics:
+      * logits come from pred CLAMPED to +-clamp (clamp > 0), so the term is
+        satisfied at the TSDF band edge and never pushes a prediction beyond it;
+      * balanced=True weights inside points by n_outside/n_inside (capped 100x)
+        so the ~2.6% minority class carries equal total weight;
+      * epsilon excludes only |target| < epsilon (sign genuinely ambiguous).
+    clamp=0, balanced=False reproduces base.sign_bce_loss exactly."""
+    mask = target.abs() > epsilon
+    if not mask.any():
+        return pred.new_zeros(())
+    p = pred[mask]
+    if clamp > 0:
+        p = p.clamp(-clamp, clamp)
+    labels = (target[mask] > 0).float()
+    weight = None
+    if balanced:
+        n_out = labels.sum()
+        n_in = labels.numel() - n_out
+        w_in = (n_out / n_in.clamp(min=1)).clamp(max=100.0)
+        weight = torch.where(labels > 0, torch.ones_like(labels), w_in.expand_as(labels))
+    return F.binary_cross_entropy_with_logits(alpha * p, labels, weight=weight)
+
+
+def sdf_loss_terms(sdf_pred: torch.Tensor, sdf_gt: torch.Tensor, args) -> tuple:
+    """The supervised terms of one step, v0.68: (sdf_loss, bce_loss, reject_frac).
+
+    sdf_loss: surface-weighted squared error against the TARGET clamped to
+    +-sdf_clamp. The prediction is NOT clamped — clamping it zeroed the gradient
+    wherever |pred| > sdf_clamp, which is the absorbing state every previous
+    run collapsed into. Weights still use the unclamped distance (weight_target).
+    loss_reject_k > 0 re-enables the old mean+k*std outlier rejection."""
+    if args.sdf_clamp > 0:
+        _c = float(args.sdf_clamp)
+        per_point = surface_weighted_se(sdf_pred, sdf_gt.clamp(-_c, _c),
+                                        sigma=args.surface_loss_sigma, weight_target=sdf_gt)
+    else:
+        per_point = surface_weighted_se(sdf_pred, sdf_gt, sigma=args.surface_loss_sigma)
+    reject_frac = sdf_pred.new_zeros(())
+    if args.loss_reject_k > 0 and per_point.numel() > 1:
+        with torch.no_grad():
+            thr = per_point.mean() + args.loss_reject_k * per_point.std()
+            keep = per_point <= thr
+        if keep.any():
+            reject_frac = 1.0 - keep.float().mean()
+            sdf_loss = per_point[keep].mean()
+        else:
+            sdf_loss = per_point.mean()
+    else:
+        sdf_loss = per_point.mean()
+    bce_loss = sign_bce_loss_v2(sdf_pred, sdf_gt, alpha=args.sign_bce_alpha,
+                                epsilon=args.sign_bce_epsilon,
+                                clamp=(args.sdf_clamp if args.sign_bce_clamp_logits else 0.0),
+                                balanced=args.sign_bce_balanced)
+    return sdf_loss, bce_loss, reject_frac
+
+
+def fd_gradient_terms(sdf_mlp, leaf, pts_trip, sdf_gt_s, nrm_s, R_gpu, radius: float,
+                      n_freqs: int, eps: float, args) -> tuple:
+    """v0.69 eikonal + normal losses from CENTRAL FINITE-DIFFERENCE gradients
+    (Neuralangelo Sec. 3.2). grad_i f(q) ~= (f(q + eps e_i) - f(q - eps e_i)) / 2 eps,
+    i.e. six extra forward evaluations through grid_sample AND the MLP, so the
+    gradient covers the triplane branch (the autograd path only ever saw the
+    Fourier-PE branch) and needs no double backward (grid_sample has none).
+    Evaluated on K random points per sample from the TSDF band |gt| < sdf_clamp,
+    where the target field has unit gradient. Returns
+    (eikonal_loss, normal_loss, grad_norm_of_valid_points)."""
+    S, N, _ = pts_trip.shape
+    K = min(int(args.eikonal_fd_points), N)
+    if args.eikonal_band_only and args.sdf_clamp > 0:
+        band = sdf_gt_s.abs() < float(args.sdf_clamp)
+    else:
+        band = torch.ones_like(sdf_gt_s, dtype=torch.bool)
+    # K random band points per sample (non-band points fill in only when a
+    # sample has fewer than K; `valid` masks them out of both losses).
+    keys = torch.rand(S, N, device=pts_trip.device) + (~band).float() * 2.0
+    idx = keys.topk(K, dim=1, largest=False).indices                    # (S, K)
+    valid = band.gather(1, idx)                                          # (S, K)
+    idx3 = idx[..., None].expand(S, K, 3)
+    q = pts_trip.gather(1, idx3).detach()                                # (S, K, 3)
+    gt = sdf_gt_s.gather(1, idx)
+    offs = torch.eye(3, device=q.device, dtype=q.dtype) * eps            # (3, 3)
+    qpm = torch.cat([q[:, :, None, :] + offs, q[:, :, None, :] - offs], dim=2)  # (S, K, 6, 3)
+    qpm = qpm.reshape(S, K * 6, 3)
+    feats = query_triplane_features_batched(qpm, leaf, radius)          # (S, 6K, 3C) -> leaf grad
+    flat = qpm.reshape(S * K * 6, 3)
+    pe = fourier_encode(flat, n_freqs) if n_freqs > 0 else flat
+    if args.use_triplane_features:
+        x = torch.cat([feats.reshape(S * K * 6, -1), pe], dim=-1)
+    else:
+        x = pe
+    f = sdf_mlp(x).reshape(S, K, 6)                                      # [+x +y +z -x -y -z]
+    grad = (f[..., :3] - f[..., 3:]) / (2.0 * eps)                       # (S, K, 3)
+    grad_norm = grad.norm(dim=-1)
+    vf = valid.to(grad.dtype)
+    eikonal_loss = (((grad_norm - 1.0) ** 2) * vf).sum() / vf.sum().clamp(min=1.0)
+    normal_loss = f.new_zeros(())
+    if args.normal_loss_weight > 0:
+        n_trip = torch.einsum("sij,skj->ski", R_gpu, nrm_s.gather(1, idx3))  # R @ n, like pts
+        nvalid = valid & (gt.abs() < args.normal_loss_threshold) & (n_trip.norm(dim=-1) > 0.5)
+        if nvalid.any():
+            cos = F.cosine_similarity(grad[nvalid], n_trip[nvalid], dim=-1, eps=1e-8)
+            normal_loss = (1.0 - cos).mean()
+    gn = grad_norm[valid]
+    return eikonal_loss, normal_loss, (gn if gn.numel() > 0 else grad_norm.reshape(-1))
+
+
+def fd_eps_at(step: int, total_steps: int, args) -> float:
+    """Coarse-to-fine FD step (Neuralangelo): exponential from eps_start to eps_end."""
+    e0, e1 = float(args.eikonal_fd_eps_start), float(args.eikonal_fd_eps_end)
+    t = min(max(step / max(total_steps, 1), 0.0), 1.0)
+    return e0 * (e1 / e0) ** t
 
 
 class CudaPrefetcher:
@@ -568,7 +774,11 @@ def _report_config_drift(ckpt_args: dict, args, is_main: bool) -> None:
         return
     watch = ("lora_block_start", "lora_block_end", "lora_rank", "lora_targets",
              "hidden_dim", "n_hidden", "n_freqs", "use_triplane_features",
-             "samples_per_batch", "eikonal_fraction", "epochs")
+             "samples_per_batch", "eikonal_fraction", "epochs",
+             "sdf_clamp", "loss_reject_k", "sign_bce_epsilon", "sign_bce_balanced",
+             "sign_bce_clamp_logits", "lr", "auto_scale_lr",
+             "eikonal_mode", "eikonal_weight", "eikonal_fd_eps_start", "eikonal_fd_eps_end",
+             "eikonal_fd_points", "eikonal_band_only", "normal_loss_weight")
     diffs = [(k, ckpt_args.get(k), getattr(args, k, None)) for k in watch
              if k in ckpt_args and ckpt_args.get(k) != getattr(args, k, None)]
     if diffs:
@@ -674,7 +884,11 @@ def run_train_fast(args: argparse.Namespace) -> None:
                 "run_name", "epochs", "save_every", "eval_every", "vis_every",
                 "n_objects", "azimuths_per_mesh", "samples_per_batch",
                 "lora_block_start", "lora_block_end", "lora_targets",
-                "eikonal_fraction", "lr", "lora_lr", "compile_backbone", "resume", "init_from")),
+                "eikonal_fraction", "lr", "auto_scale_lr", "lora_lr", "sdf_clamp",
+                "loss_reject_k", "sign_bce_weight", "sign_bce_epsilon", "sign_bce_balanced",
+                "sign_bce_clamp_logits", "eikonal_mode", "eikonal_weight", "eikonal_fd_eps_start",
+                "eikonal_fd_eps_end", "eikonal_fd_points", "eikonal_band_only", "normal_loss_weight",
+                "compile_backbone", "resume", "init_from")),
               flush=True)
 
     wandb_enabled = False
@@ -1022,8 +1236,9 @@ def run_train_fast(args: argparse.Namespace) -> None:
         diag_steps = 0
         # GPU-side accumulators, ONE host sync per epoch (each .item() in the
         # loop would drain the CUDA queue and stall the CPU's run-ahead).
-        # slots: loss, sdf, mse, eik, bce, nrm, sign_acc, preclip, reject, gradmean
-        _acc  = torch.zeros(10, device=device)
+        # slots: loss, sdf, mse, eik, bce, nrm, sign_acc, preclip, reject, gradmean,
+        #        pred_std, inside_correct (COUNT), inside_total (COUNT)   [v0.68 collapse detectors]
+        _acc  = torch.zeros(13, device=device)
         _mins = torch.full((3,), float("inf"),  device=device)
         _maxs = torch.full((3,), float("-inf"), device=device)
         if pbar is not None:
@@ -1071,69 +1286,68 @@ def run_train_fast(args: argparse.Namespace) -> None:
                 sdf_pred = sdf_mlp(model_in)
                 sdf_gt = sdf_gt_s.reshape(B)
 
-                # TSDF clamp + surface weighting + outlier rejection: identical
-                # formulas to train_sdf_head.py.
-                if args.sdf_clamp > 0:
-                    _c = float(args.sdf_clamp)
-                    per_point = surface_weighted_se(
-                        sdf_pred.clamp(-_c, _c), sdf_gt.clamp(-_c, _c),
-                        sigma=args.surface_loss_sigma, weight_target=sdf_gt)
+                # v0.68 loss: target-only TSDF clamp, band-clamped balanced sign-BCE,
+                # rejection off by default. See sdf_loss_terms / LOSS_FIX_HANDOFF.md.
+                sdf_loss, bce_loss, reject_frac = sdf_loss_terms(sdf_pred, sdf_gt, args)
+
+                if args.eikonal_mode == "fd" and (args.eikonal_weight > 0 or args.normal_loss_weight > 0):
+                    # v0.69: full-field gradient by central finite differences on
+                    # TSDF-band points (covers the triplane branch; reaches the
+                    # backbone through `leaf`). See fd_gradient_terms.
+                    _eps = fd_eps_at(epoch * len(loader) + diag_steps, total_steps, args)
+                    eikonal_loss, normal_loss, grad_norm = fd_gradient_terms(
+                        sdf_mlp, leaf, pts_trip, sdf_gt_s, nrm_s, R_gpu, radius,
+                        n_freqs, _eps, args)
+                    gradients = None
+                    if args.eikonal_weight <= 0:
+                        eikonal_loss = eikonal_loss * 0.0   # logged as 0 when disabled
                 else:
-                    per_point = surface_weighted_se(sdf_pred, sdf_gt,
-                                                    sigma=args.surface_loss_sigma)
-                reject_frac = sdf_pred.new_zeros(())
-                if args.loss_reject_k > 0 and per_point.numel() > 1:
-                    with torch.no_grad():
-                        thr = per_point.mean() + args.loss_reject_k * per_point.std()
-                        keep = per_point <= thr
-                    if keep.any():
-                        reject_frac = 1.0 - keep.float().mean()
-                        sdf_loss = per_point[keep].mean()
+                    # "autograd_pe" (pre-v0.69) path, or every gradient term disabled.
+                    # Eikonal on a random subset of the pool (see EIKONAL_FRACTION). The
+                    # subset gets its own small forward so the double-backward only
+                    # spans K points; feats are gathered WITHOUT detach so the (tiny)
+                    # eikonal->triplane gradient path is preserved exactly as before.
+                    _eik_K = int(B * args.eikonal_fraction)
+                    if args.eikonal_weight <= 0 and args.normal_loss_weight <= 0:
+                        # Ablation: no eikonal term -> skip the create_graph double
+                        # backward entirely (it is ~all of the MLP step's cost and
+                        # would only feed a zero-weighted loss). Diagnostics that
+                        # read grad_norm see zeros.
+                        gradients = torch.zeros_like(query_pts)
+                    elif 0 < _eik_K < B and args.normal_loss_weight <= 0:
+                        _e_idx = torch.randperm(B, device=device)[:_eik_K]
+                        _q_e = query_pts[_e_idx].detach().requires_grad_(True)
+                        _pe_e = fourier_encode(_q_e, n_freqs)
+                        _in_e = (torch.cat([flat_feats[_e_idx], _pe_e], dim=-1)
+                                 if args.use_triplane_features else _pe_e)
+                        _pred_e = sdf_mlp(_in_e)
+                        gradients = torch.autograd.grad(
+                            outputs=_pred_e, inputs=_q_e,
+                            grad_outputs=torch.ones_like(_pred_e),
+                            create_graph=True)[0]
                     else:
-                        sdf_loss = per_point.mean()
-                else:
-                    sdf_loss = per_point.mean()
+                        gradients = torch.autograd.grad(
+                            outputs=sdf_pred, inputs=query_pts,
+                            grad_outputs=torch.ones_like(sdf_pred),
+                            create_graph=True, retain_graph=True)[0]
+                    grad_norm = gradients.norm(dim=-1)
+                    eikonal_loss = ((grad_norm - 1.0) ** 2).mean()
+                    if args.eikonal_weight <= 0:
+                        eikonal_loss = eikonal_loss * 0.0   # logged as 0, not (0-1)^2
 
-                bce_loss = sign_bce_loss(sdf_pred, sdf_gt, alpha=args.sign_bce_alpha,
-                                         epsilon=args.sign_bce_epsilon)
-
-                # Eikonal on a random subset of the pool (see EIKONAL_FRACTION). The
-                # subset gets its own small forward so the double-backward only
-                # spans K points; feats are gathered WITHOUT detach so the (tiny)
-                # eikonal->triplane gradient path is preserved exactly as before.
-                _eik_K = int(B * args.eikonal_fraction)
-                if 0 < _eik_K < B and args.normal_loss_weight <= 0:
-                    _e_idx = torch.randperm(B, device=device)[:_eik_K]
-                    _q_e = query_pts[_e_idx].detach().requires_grad_(True)
-                    _pe_e = fourier_encode(_q_e, n_freqs)
-                    _in_e = (torch.cat([flat_feats[_e_idx], _pe_e], dim=-1)
-                             if args.use_triplane_features else _pe_e)
-                    _pred_e = sdf_mlp(_in_e)
-                    gradients = torch.autograd.grad(
-                        outputs=_pred_e, inputs=_q_e,
-                        grad_outputs=torch.ones_like(_pred_e),
-                        create_graph=True)[0]
-                else:
-                    gradients = torch.autograd.grad(
-                        outputs=sdf_pred, inputs=query_pts,
-                        grad_outputs=torch.ones_like(sdf_pred),
-                        create_graph=True, retain_graph=True)[0]
-                grad_norm = gradients.norm(dim=-1)
-                eikonal_loss = ((grad_norm - 1.0) ** 2).mean()
-
-                if args.normal_loss_weight > 0:
-                    nrm_trip = torch.einsum(
-                        "sij,snj->sni", R_gpu, nrm_s).reshape(B, 3)
-                    nrm_valid = ((sdf_gt.abs() < args.normal_loss_threshold)
-                                 & (nrm_trip.norm(dim=-1) > 0.5))
-                    if nrm_valid.any():
-                        g_pred = F.normalize(gradients[nrm_valid], dim=-1, eps=1e-8)
-                        g_gt   = F.normalize(nrm_trip[nrm_valid], dim=-1, eps=1e-8)
-                        normal_loss = (1.0 - (g_pred * g_gt).sum(dim=-1)).mean()
+                    if args.normal_loss_weight > 0:
+                        nrm_trip = torch.einsum(
+                            "sij,snj->sni", R_gpu, nrm_s).reshape(B, 3)
+                        nrm_valid = ((sdf_gt.abs() < args.normal_loss_threshold)
+                                     & (nrm_trip.norm(dim=-1) > 0.5))
+                        if nrm_valid.any():
+                            g_pred = F.normalize(gradients[nrm_valid], dim=-1, eps=1e-8)
+                            g_gt   = F.normalize(nrm_trip[nrm_valid], dim=-1, eps=1e-8)
+                            normal_loss = (1.0 - (g_pred * g_gt).sum(dim=-1)).mean()
+                        else:
+                            normal_loss = sdf_pred.new_zeros(())
                     else:
                         normal_loss = sdf_pred.new_zeros(())
-                else:
-                    normal_loss = sdf_pred.new_zeros(())
 
                 loss = (sdf_loss
                         + args.eikonal_weight * eikonal_loss
@@ -1191,6 +1405,9 @@ def run_train_fast(args: argparse.Namespace) -> None:
                     (torch.sign(sdf_pred) == torch.sign(sdf_gt)).float().mean(),
                     preclip_norm.detach(), reject_frac.detach(),
                     grad_norm.mean().detach(),
+                    sdf_pred.detach().std(),
+                    ((sdf_pred < 0) & (sdf_gt < 0)).float().sum(),
+                    (sdf_gt < 0).float().sum(),
                 ])
                 _mins = torch.minimum(_mins, torch.stack(
                     [grad_norm.min().detach(), sdf_pred.min().detach(), sdf_gt.min()]))
@@ -1203,7 +1420,8 @@ def run_train_fast(args: argparse.Namespace) -> None:
                 if diag_steps % max(1, args.diag_every) == 0:
                     pbar.set_postfix(loss=f"{loss.item():.5f}",
                                      sdf=f"{sdf_loss.item():.5f}",
-                                     eik=f"{eikonal_loss.item():.5f}")
+                                     eik=f"{eikonal_loss.item():.5f}",
+                                     pstd=f"{sdf_pred.detach().std().item():.4f}")
             if is_main and wandb_enabled and diag_steps % max(1, args.diag_every) == 0:
                 try:
                     wandb.log({
@@ -1223,7 +1441,8 @@ def run_train_fast(args: argparse.Namespace) -> None:
 
         # ── End of epoch: single host sync for all statistics ────────────────
         (epoch_loss, epoch_sdf, epoch_mse, epoch_eik, epoch_bce, epoch_nrm,
-         sign_acc_sum, preclip_sum, reject_sum, grad_mean_sum) = _acc.tolist()
+         sign_acc_sum, preclip_sum, reject_sum, grad_mean_sum,
+         pred_std_sum, inside_correct, inside_total) = _acc.tolist()
         gmin, pmin, tmin = _mins.tolist()
         gmax, pmax, tmax = _maxs.tolist()
 
@@ -1233,6 +1452,11 @@ def run_train_fast(args: argparse.Namespace) -> None:
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
             (epoch_loss, epoch_sdf, epoch_mse,
              epoch_eik, epoch_bce, epoch_nrm) = (t / world_size).tolist()
+            # Counts are summed (not averaged) across ranks.
+            c = torch.tensor([inside_correct, inside_total], device=device)
+            dist.all_reduce(c, op=dist.ReduceOp.SUM)
+            inside_correct, inside_total = c.tolist()
+        sign_acc_inside = inside_correct / inside_total if inside_total > 0 else float("nan")
 
         epoch_wall = time.perf_counter() - epoch_t0
         if is_main:
@@ -1241,10 +1465,16 @@ def run_train_fast(args: argparse.Namespace) -> None:
             steps_s = diag_steps / epoch_wall if epoch_wall > 0 else 0.0
             eta_h = (args.epochs - epoch - 1) * epoch_wall / 3600.0
             _stages = "  ".join(f"{k}={v:.0f}ms" for k, v in stage_ms.items())
+            pred_std_epoch = pred_std_sum / _ns
+            _collapse = ("  <-- COLLAPSE?" if (pred_std_epoch < 0.02 or sign_acc_inside < 0.01)
+                         else "")
             tqdm.write(
                 f"[epoch {epoch + 1}] {epoch_wall:.1f}s  "
                 f"{steps_s:.2f} steps/s  {steps_s * points_per_step / 1e6:.2f} Mpts/s  "
-                f"data_wait={data_wait:.1f}s  {_stages}  ETA {eta_h:.1f}h")
+                f"data_wait={data_wait:.1f}s  {_stages}  "
+                f"sdf={epoch_sdf / _ns:.5f} eik={epoch_eik / _ns:.5f} "
+                f"pstd={pred_std_epoch:.4f} sign_acc_in={sign_acc_inside:.3f}  "
+                f"ETA {eta_h:.1f}h{_collapse}")
             if wandb_enabled:
                 try:
                     wandb.log({
@@ -1255,6 +1485,8 @@ def run_train_fast(args: argparse.Namespace) -> None:
                         "train/epoch_sign_bce_loss": epoch_bce / _ns,
                         "train/epoch_normal_loss": epoch_nrm / _ns,
                         "diag/sign_accuracy": sign_acc_sum / _ns,
+                        "diag/sign_acc_inside": sign_acc_inside,
+                        "diag/pred_std": pred_std_epoch,
                         "diag/grad_norm_preclip_mean": preclip_sum / _ns,
                         "diag/reject_frac_mean": reject_sum / _ns,
                         "diag/grad_norm_mean": grad_mean_sum / _ns,
@@ -1276,11 +1508,13 @@ def run_train_fast(args: argparse.Namespace) -> None:
         # always — a rank with no shard (or a skipped epoch) reduces zeros. ───
         _run_eval = ((epoch + 1) % max(1, args.eval_every) == 0
                      or (epoch + 1) == args.epochs)
-        _test_acc = torch.zeros(5, device=device)  # weighted, mse, mse_clamped, sign, steps
+        _test_acc = torch.zeros(7, device=device)  # weighted, mse, mse_clamped, sign, steps,
+                                                   # inside_correct (count), inside_total (count)
         if test_loader is not None and _run_eval:
             _mlp_module.eval()
             triposr_model.eval()
             tw = tm = tmc = tsa = 0.0
+            tin_ok = tin_n = 0.0
             tsteps = 0
             with torch.no_grad():
                 for t_pts, t_sdf, _t_nrm, t_imgs, t_tok, t_R, _ in test_prefetch:
@@ -1317,20 +1551,28 @@ def run_train_fast(args: argparse.Namespace) -> None:
                             tmc += F.mse_loss(pred.clamp(-_tc, _tc),
                                               ms.clamp(-_tc, _tc)).item()
                         tsa += float((torch.sign(pred) == torch.sign(ms)).float().mean())
+                        tin_ok += float(((pred < 0) & (ms < 0)).float().sum())
+                        tin_n += float((ms < 0).float().sum())
                         tsteps += 1
                     del t_trip, t_codes
             _mlp_module.train()
             triposr_model.train()
-            _test_acc = torch.tensor([tw, tm, tmc, tsa, float(tsteps)], device=device)
+            _test_acc = torch.tensor([tw, tm, tmc, tsa, float(tsteps), tin_ok, tin_n],
+                                     device=device)
         if is_ddp:
             dist.all_reduce(_test_acc, op=dist.ReduceOp.SUM)
-        _tw, _tm, _tmc, _tsa, _tsteps = _test_acc.tolist()
+        _tw, _tm, _tmc, _tsa, _tsteps, _tin_ok, _tin_n = _test_acc.tolist()
+        if is_main and _tsteps > 0:
+            tqdm.write(f"[test epoch {epoch + 1}] sdf_loss={_tw / _tsteps:.5f} "
+                       f"mse={_tm / _tsteps:.5f} sign_acc={_tsa / _tsteps:.4f} "
+                       f"sign_acc_inside={(_tin_ok / _tin_n if _tin_n > 0 else float('nan')):.3f}")
         if is_main and wandb_enabled and _tsteps > 0:
             try:
                 _log = {
                     "test/epoch_sdf_loss": _tw / _tsteps,
                     "test/epoch_mse": _tm / _tsteps,
                     "test/sign_accuracy": _tsa / _tsteps,
+                    "test/sign_acc_inside": _tin_ok / _tin_n if _tin_n > 0 else float("nan"),
                     "train/epoch": epoch + 1,
                 }
                 if args.sdf_clamp > 0:
@@ -1426,9 +1668,16 @@ def build_train_args() -> argparse.Namespace:
         onecycle_pct_start = ONECYCLE_PCT_START,
         eikonal_weight        = EIKONAL_WEIGHT,
         eikonal_fraction = float(os.environ.get("SDFER_EIKONAL_FRACTION", EIKONAL_FRACTION)),
+        eikonal_mode          = EIKONAL_MODE,
+        eikonal_fd_eps_start  = EIKONAL_FD_EPS_START,
+        eikonal_fd_eps_end    = EIKONAL_FD_EPS_END,
+        eikonal_fd_points     = EIKONAL_FD_POINTS,
+        eikonal_band_only     = EIKONAL_BAND_ONLY,
         sign_bce_weight       = SIGN_BCE_WEIGHT,
         sign_bce_alpha        = SIGN_BCE_ALPHA,
         sign_bce_epsilon      = SIGN_BCE_EPSILON,
+        sign_bce_balanced     = SIGN_BCE_BALANCED,
+        sign_bce_clamp_logits = SIGN_BCE_CLAMP_LOGITS,
         surface_loss_sigma    = SURFACE_LOSS_SIGMA,
         sdf_clamp             = SDF_CLAMP,
         normal_loss_weight    = NORMAL_LOSS_WEIGHT,
@@ -1930,6 +2179,17 @@ def main() -> None:
         if _v is not None:
             setattr(args, _k, int(_v))
             print(f"[env] {_k} = {int(_v)}")
+    # Ablation-study knobs (ablation/run_ablation.sh): loss-term weights and run identity.
+    for _k in ("eikonal_weight", "sign_bce_weight"):
+        _v = os.environ.get("SDFER_" + _k.upper())
+        if _v is not None:
+            setattr(args, _k, float(_v))
+            print(f"[env] {_k} = {float(_v)}")
+    for _k in ("run_name", "output_dir"):
+        _v = os.environ.get("SDFER_" + _k.upper())
+        if _v:
+            setattr(args, _k, _v)
+            print(f"[env] {_k} = {_v!r}")
 
     if _cli.command in ("precompute", "both"):
         # SDFER_PRECOMPUTE_LEGACY=1 falls back to the original serial pipeline.
