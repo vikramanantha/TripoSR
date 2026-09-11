@@ -226,8 +226,8 @@ EIKONAL_FRACTION      = 0.25  # fraction of the pool the eikonal term is evaluat
 SIGN_BCE_WEIGHT       = 0.1
 SIGN_BCE_ALPHA        = 20.0
 SIGN_BCE_EPSILON      = 0.005  # v0.68: was 0.02 (excluded 95% of all inside points)
-SIGN_BCE_BALANCED     = True   # v0.68 NEW: inside class weighted n_out/n_in per pool (cap 100x)
-SIGN_BCE_CLAMP_LOGITS = True   # v0.68 NEW: BCE logits from pred clamped to +-SDF_CLAMP
+SIGN_BCE_BALANCED     = False  # v0.69: back to the unweighted (pre-v0.68) BCE; True = v0.68 n_out/n_in weighting (cap 100x)
+SIGN_BCE_CLAMP_LOGITS = False  # v0.69: logits from the RAW prediction (pre-v0.68); True = v0.68 band-clamped logits
 SURFACE_LOSS_SIGMA    = 0.05
 SDF_CLAMP             = 0.1    # v0.68: now clamps the TARGET only (see sdf_loss_terms)
 NORMAL_LOSS_WEIGHT    = 1e-3  # v0.69: ON, same FD gradient vs normal_gt.pt; 0.0 for a single-variable run
@@ -503,7 +503,8 @@ def sign_bce_loss_v2(pred: torch.Tensor, target: torch.Tensor, alpha: float,
       * balanced=True weights inside points by n_outside/n_inside (capped 100x)
         so the ~2.6% minority class carries equal total weight;
       * epsilon excludes only |target| < epsilon (sign genuinely ambiguous).
-    clamp=0, balanced=False reproduces base.sign_bce_loss exactly."""
+    clamp=0, balanced=False reproduces base.sign_bce_loss exactly — which is what
+    v0.69 runs (pre-v0.68 BCE form under the fixed, target-only-clamped distance loss)."""
     mask = target.abs() > epsilon
     if not mask.any():
         return pred.new_zeros(())
@@ -1286,8 +1287,9 @@ def run_train_fast(args: argparse.Namespace) -> None:
                 sdf_pred = sdf_mlp(model_in)
                 sdf_gt = sdf_gt_s.reshape(B)
 
-                # v0.68 loss: target-only TSDF clamp, band-clamped balanced sign-BCE,
-                # rejection off by default. See sdf_loss_terms / LOSS_FIX_HANDOFF.md.
+                # v0.68 loss: target-only TSDF clamp, rejection off. Sign-BCE form is
+                # config-selected: v0.69 default = unweighted, unclamped logits
+                # (pre-v0.68); SIGN_BCE_BALANCED / SIGN_BCE_CLAMP_LOGITS = v0.68 form.
                 sdf_loss, bce_loss, reject_frac = sdf_loss_terms(sdf_pred, sdf_gt, args)
 
                 if args.eikonal_mode == "fd" and (args.eikonal_weight > 0 or args.normal_loss_weight > 0):
@@ -2185,6 +2187,14 @@ def main() -> None:
         if _v is not None:
             setattr(args, _k, float(_v))
             print(f"[env] {_k} = {float(_v)}")
+    for _k in ("sign_bce_epsilon",):
+        _v = os.environ.get("SDFER_" + _k.upper())
+        if _v is not None:
+            setattr(args, _k, float(_v)); print(f"[env] {_k} = {float(_v)}")
+    for _k in ("sign_bce_balanced", "sign_bce_clamp_logits"):
+        _v = os.environ.get("SDFER_" + _k.upper())
+        if _v is not None:
+            setattr(args, _k, bool(int(_v))); print(f"[env] {_k} = {bool(int(_v))}")
     for _k in ("run_name", "output_dir"):
         _v = os.environ.get("SDFER_" + _k.upper())
         if _v:
