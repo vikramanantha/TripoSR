@@ -223,12 +223,17 @@ EIKONAL_FRACTION      = 0.25  # fraction of the pool the eikonal term is evaluat
                               # same expectation is the standard IGR/SIREN move. 1.0 = old behaviour.
                               # Forced to 1.0 while NORMAL_LOSS_WEIGHT > 0 (that loss needs per-point
                               # gradients at near-surface points across the whole pool).
-SIGN_BCE_WEIGHT       = 0.1
+SIGN_BCE_WEIGHT       = 0.0    # v0.69 (2026-09-12): sign-BCE REMOVED. Every form of it hurt: the
+                               # balanced band-clamped v0.68 term dominated the loss (91%) and biased
+                               # near-surface outside points to the band edge; the original unclamped
+                               # term erased the zero level set (87/100 empty meshes by epoch 10).
+                               # Without it (FD eikonal + normal loss on): F 0.54 @ ep10 vs <=0.38 ever.
 SIGN_BCE_ALPHA        = 20.0
 SIGN_BCE_EPSILON      = 0.005  # v0.68: was 0.02 (excluded 95% of all inside points)
 SIGN_BCE_BALANCED     = False  # v0.69: back to the unweighted (pre-v0.68) BCE; True = v0.68 n_out/n_in weighting (cap 100x)
 SIGN_BCE_CLAMP_LOGITS = False  # v0.69: logits from the RAW prediction (pre-v0.68); True = v0.68 band-clamped logits
-SURFACE_LOSS_SIGMA    = 0.05
+SURFACE_LOSS_SIGMA    = 0.05   # exp(-|sdf|/sigma) weighting of the squared error (v0.44); <= 0 disables
+                               # it (plain squared error) — the "no surface weighting" ablation arm.
 SDF_CLAMP             = 0.1    # v0.68: now clamps the TARGET only (see sdf_loss_terms)
 NORMAL_LOSS_WEIGHT    = 1e-3  # v0.69: ON, same FD gradient vs normal_gt.pt; 0.0 for a single-variable run
 NORMAL_LOSS_THRESHOLD = 0.05
@@ -529,12 +534,11 @@ def sdf_loss_terms(sdf_pred: torch.Tensor, sdf_gt: torch.Tensor, args) -> tuple:
     wherever |pred| > sdf_clamp, which is the absorbing state every previous
     run collapsed into. Weights still use the unclamped distance (weight_target).
     loss_reject_k > 0 re-enables the old mean+k*std outlier rejection."""
-    if args.sdf_clamp > 0:
-        _c = float(args.sdf_clamp)
-        per_point = surface_weighted_se(sdf_pred, sdf_gt.clamp(-_c, _c),
-                                        sigma=args.surface_loss_sigma, weight_target=sdf_gt)
+    _tgt = sdf_gt.clamp(-float(args.sdf_clamp), float(args.sdf_clamp)) if args.sdf_clamp > 0 else sdf_gt
+    if args.surface_loss_sigma > 0:
+        per_point = surface_weighted_se(sdf_pred, _tgt, sigma=args.surface_loss_sigma, weight_target=sdf_gt)
     else:
-        per_point = surface_weighted_se(sdf_pred, sdf_gt, sigma=args.surface_loss_sigma)
+        per_point = (sdf_pred - _tgt) ** 2          # ablation: no near-surface weighting
     reject_frac = sdf_pred.new_zeros(())
     if args.loss_reject_k > 0 and per_point.numel() > 1:
         with torch.no_grad():
@@ -777,7 +781,7 @@ def _report_config_drift(ckpt_args: dict, args, is_main: bool) -> None:
              "hidden_dim", "n_hidden", "n_freqs", "use_triplane_features",
              "samples_per_batch", "eikonal_fraction", "epochs",
              "sdf_clamp", "loss_reject_k", "sign_bce_epsilon", "sign_bce_balanced",
-             "sign_bce_clamp_logits", "lr", "auto_scale_lr",
+             "sign_bce_clamp_logits", "surface_loss_sigma", "lr", "auto_scale_lr",
              "eikonal_mode", "eikonal_weight", "eikonal_fd_eps_start", "eikonal_fd_eps_end",
              "eikonal_fd_points", "eikonal_band_only", "normal_loss_weight")
     diffs = [(k, ckpt_args.get(k), getattr(args, k, None)) for k in watch
@@ -887,7 +891,7 @@ def run_train_fast(args: argparse.Namespace) -> None:
                 "lora_block_start", "lora_block_end", "lora_targets",
                 "eikonal_fraction", "lr", "auto_scale_lr", "lora_lr", "sdf_clamp",
                 "loss_reject_k", "sign_bce_weight", "sign_bce_epsilon", "sign_bce_balanced",
-                "sign_bce_clamp_logits", "eikonal_mode", "eikonal_weight", "eikonal_fd_eps_start",
+                "sign_bce_clamp_logits", "surface_loss_sigma", "eikonal_mode", "eikonal_weight", "eikonal_fd_eps_start",
                 "eikonal_fd_eps_end", "eikonal_fd_points", "eikonal_band_only", "normal_loss_weight",
                 "compile_backbone", "resume", "init_from")),
               flush=True)
@@ -1545,8 +1549,8 @@ def run_train_fast(args: argparse.Namespace) -> None:
                             mi = ff[c0:c1] if args.use_triplane_features else fp[c0:c1]
                         pred = _mlp_module(mi)
                         ms = fs[c0:c1]
-                        tw += surface_weighted_mse_loss(
-                            pred, ms, sigma=args.surface_loss_sigma).item()
+                        tw += (surface_weighted_mse_loss(pred, ms, sigma=args.surface_loss_sigma)
+                               if args.surface_loss_sigma > 0 else F.mse_loss(pred, ms)).item()
                         tm += F.mse_loss(pred, ms).item()
                         if args.sdf_clamp > 0:
                             _tc = float(args.sdf_clamp)
@@ -2182,7 +2186,7 @@ def main() -> None:
             setattr(args, _k, int(_v))
             print(f"[env] {_k} = {int(_v)}")
     # Ablation-study knobs (ablation/run_ablation.sh): loss-term weights and run identity.
-    for _k in ("eikonal_weight", "sign_bce_weight"):
+    for _k in ("eikonal_weight", "sign_bce_weight", "surface_loss_sigma", "normal_loss_weight"):
         _v = os.environ.get("SDFER_" + _k.upper())
         if _v is not None:
             setattr(args, _k, float(_v))
