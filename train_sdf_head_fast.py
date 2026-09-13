@@ -232,7 +232,7 @@ SIGN_BCE_ALPHA        = 20.0
 SIGN_BCE_EPSILON      = 0.005  # v0.68: was 0.02 (excluded 95% of all inside points)
 SIGN_BCE_BALANCED     = False  # v0.69: back to the unweighted (pre-v0.68) BCE; True = v0.68 n_out/n_in weighting (cap 100x)
 SIGN_BCE_CLAMP_LOGITS = False  # v0.69: logits from the RAW prediction (pre-v0.68); True = v0.68 band-clamped logits
-SURFACE_LOSS_SIGMA    = 0.05   # exp(-|sdf|/sigma) weighting of the squared error (v0.44); <= 0 disables
+SURFACE_LOSS_SIGMA    = 0.0    # v0.69 (2026-09-13): weighting OFF (study 3: it slightly hurt); 0.05 = exp(-|sdf|/sigma) weighting (v0.44); <= 0 disables
                                # it (plain squared error) — the "no surface weighting" ablation arm.
 SDF_CLAMP             = 0.1    # v0.68: now clamps the TARGET only (see sdf_loss_terms)
 NORMAL_LOSS_WEIGHT    = 1e-3  # v0.69: ON, same FD gradient vs normal_gt.pt; 0.0 for a single-variable run
