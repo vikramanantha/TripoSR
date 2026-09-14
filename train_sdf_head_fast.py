@@ -159,7 +159,10 @@ def _resolve_ws_frb_root() -> str:
 DATASET_DIR     = os.environ.get("SDFER_DATASET_DIR") or os.path.join(
                       _resolve_ws_frb_root(), "users/markiv/sdfer/TripoSR/precomputed")
 OUTPUT_DIR      = "/home/markiv/TripoSR/sdf_checkpoints"
-RUN_NAME        = "v0.69_100k"   # v0.69: finite-difference eikonal + normal loss (see fd_gradient_terms)
+RUN_NAME        = "v0.691"       # v0.691 (2026-09-14): FD eikonal + normal loss, target-only clamp, plain SE;
+                                 # no sign-BCE, no surface weighting (ablation studies 1-4)
+FREEZE_BACKBONE = False          # True = no LoRA fine-tuning: stock TripoSR triplane, only the SDF head trains
+                                 # (adapters are still injected with B=0 so checkpoints keep the lora_model layout)
 MODEL           = "stabilityai/TripoSR"
 
 # ── Scale / schedule ─────────────────────────────────────────────────────────
@@ -891,7 +894,7 @@ def run_train_fast(args: argparse.Namespace) -> None:
                 "lora_block_start", "lora_block_end", "lora_targets",
                 "eikonal_fraction", "lr", "auto_scale_lr", "lora_lr", "sdf_clamp",
                 "loss_reject_k", "sign_bce_weight", "sign_bce_epsilon", "sign_bce_balanced",
-                "sign_bce_clamp_logits", "surface_loss_sigma", "eikonal_mode", "eikonal_weight", "eikonal_fd_eps_start",
+                "sign_bce_clamp_logits", "surface_loss_sigma", "freeze_backbone", "eikonal_mode", "eikonal_weight", "eikonal_fd_eps_start",
                 "eikonal_fd_eps_end", "eikonal_fd_points", "eikonal_band_only", "normal_loss_weight",
                 "compile_backbone", "resume", "init_from")),
               flush=True)
@@ -1014,6 +1017,15 @@ def run_train_fast(args: argparse.Namespace) -> None:
     lora_trainable_params = apply_lora_selective(
         triposr_model, args.lora_block_start, args.lora_block_end,
         args.lora_rank, args.lora_alpha, args.lora_targets)
+    if args.freeze_backbone:
+        # Ablation "no LoRA fine-tuning": freeze EVERYTHING in TripoSR (adapters,
+        # post_processor). lora_B is zero-initialised, so the adapters are exact
+        # identities and the triplane is stock TripoSR's for the whole run.
+        for p in triposr_model.parameters():
+            p.requires_grad_(False)
+        lora_trainable_params = []
+        if is_main:
+            print("[freeze] backbone frozen: no LoRA / post_processor updates; head-only training")
     triposr_model.to(device)
     # All ranks must start from IDENTICAL LoRA weights (lora_A is randomly
     # initialized per process); broadcast rank 0's.
@@ -1115,8 +1127,9 @@ def run_train_fast(args: argparse.Namespace) -> None:
                   f"-> sqrt scale {_scale:.3f}: lr={args.lr:.2e}  lora_lr={args.lora_lr:.2e}")
 
     optimizer = _make_adamw(sdf_mlp.parameters(), args.lr, args.weight_decay, device)
-    lora_optimizer = _make_adamw(lora_trainable_params, args.lora_lr,
-                                 args.lora_weight_decay, device)
+    lora_optimizer = (_make_adamw(lora_trainable_params, args.lora_lr,
+                                  args.lora_weight_decay, device)
+                      if lora_trainable_params else None)   # None when the backbone is frozen
 
     # ONE gradient step per outer step, by construction (no inner minibatching).
     total_steps = args.epochs * len(loader)
@@ -1158,7 +1171,7 @@ def run_train_fast(args: argparse.Namespace) -> None:
         except ValueError as e:
             if is_main:
                 print(f"  [RESUME] sdf_mlp optimizer state incompatible ({e}); starting fresh.")
-        if "lora_optimizer" in ckpt:
+        if "lora_optimizer" in ckpt and lora_optimizer is not None:
             try:
                 lora_optimizer.load_state_dict(ckpt["lora_optimizer"])
             except ValueError as e:
@@ -1361,7 +1374,8 @@ def run_train_fast(args: argparse.Namespace) -> None:
                         + args.normal_loss_weight * normal_loss)
 
                 optimizer.zero_grad(set_to_none=True)
-                lora_optimizer.zero_grad(set_to_none=True)
+                if lora_optimizer is not None:
+                    lora_optimizer.zero_grad(set_to_none=True)
                 loss.backward()   # -> MLP grads (DDP all-reduced) + leaf.grad
                 preclip_norm = torch.nn.utils.clip_grad_norm_(
                     sdf_mlp.parameters(), args.grad_clip)
@@ -1371,12 +1385,13 @@ def run_train_fast(args: argparse.Namespace) -> None:
 
             # ── 3. Backbone backward + LoRA step ─────────────────────────────
             with timers.stage("backbone_bwd_opt"):
-                if leaf.grad is not None:
-                    torch.autograd.backward(trip, leaf.grad)
-                if is_ddp:
-                    flat_all_reduce_grads(lora_trainable_params, world_size)
-                torch.nn.utils.clip_grad_norm_(lora_trainable_params, args.grad_clip)
-                lora_optimizer.step()
+                if lora_optimizer is not None:      # frozen backbone: nothing to update
+                    if leaf.grad is not None:
+                        torch.autograd.backward(trip, leaf.grad)
+                    if is_ddp:
+                        flat_all_reduce_grads(lora_trainable_params, world_size)
+                    torch.nn.utils.clip_grad_norm_(lora_trainable_params, args.grad_clip)
+                    lora_optimizer.step()
 
             if bench_steps:
                 torch.cuda.synchronize()
@@ -1602,7 +1617,7 @@ def run_train_fast(args: argparse.Namespace) -> None:
                 "meta": meta,
                 "args": vars(args),
                 "lora_model": triposr_model.state_dict(),
-                "lora_optimizer": lora_optimizer.state_dict(),
+                "lora_optimizer": lora_optimizer.state_dict() if lora_optimizer is not None else None,
             }, ckpt_path)
 
         # Vis is diagnostics: never let a vis crash kill a multi-day run.
@@ -1710,6 +1725,7 @@ def build_train_args() -> argparse.Namespace:
         diag_every     = DIAG_EVERY,
         num_workers    = NUM_WORKERS,
         gradient_checkpointing = GRADIENT_CHECKPOINTING,
+        freeze_backbone = FREEZE_BACKBONE,
         compile_backbone       = COMPILE_BACKBONE,
         resume         = os.environ.get("SDFER_RESUME", RESUME) or None,
         init_from      = os.environ.get("SDFER_INIT_FROM", INIT_FROM) or None,
@@ -2186,7 +2202,8 @@ def main() -> None:
             setattr(args, _k, int(_v))
             print(f"[env] {_k} = {int(_v)}")
     # Ablation-study knobs (ablation/run_ablation.sh): loss-term weights and run identity.
-    for _k in ("eikonal_weight", "sign_bce_weight", "surface_loss_sigma", "normal_loss_weight"):
+    for _k in ("eikonal_weight", "sign_bce_weight", "surface_loss_sigma", "normal_loss_weight",
+               "sdf_clamp"):
         _v = os.environ.get("SDFER_" + _k.upper())
         if _v is not None:
             setattr(args, _k, float(_v))
@@ -2195,7 +2212,7 @@ def main() -> None:
         _v = os.environ.get("SDFER_" + _k.upper())
         if _v is not None:
             setattr(args, _k, float(_v)); print(f"[env] {_k} = {float(_v)}")
-    for _k in ("sign_bce_balanced", "sign_bce_clamp_logits"):
+    for _k in ("sign_bce_balanced", "sign_bce_clamp_logits", "freeze_backbone"):
         _v = os.environ.get("SDFER_" + _k.upper())
         if _v is not None:
             setattr(args, _k, bool(int(_v))); print(f"[env] {_k} = {bool(int(_v))}")
